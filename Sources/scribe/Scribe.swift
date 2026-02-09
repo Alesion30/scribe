@@ -287,13 +287,22 @@ private func resolveConfig(
     let fileConfig = try ScribeConfig.load()
     try fileConfig.ensureDirectories()
 
-    return ResolvedConfig(
+    let resolved = ResolvedConfig(
         model: model ?? fileConfig.resolvedModel,
         language: language ?? fileConfig.resolvedLanguage,
         noMic: noMic || fileConfig.resolvedNoMic,
         noSystem: noSystem || fileConfig.resolvedNoSystem,
         recordingsDir: fileConfig.resolvedRecordingsDir
     )
+
+    Log.status("Config:")
+    Log.status("  model        = \(resolved.model)\(model != nil ? " (CLI)" : fileConfig.model != nil ? " (config)" : " (default)")")
+    Log.status("  language     = \(resolved.language)\(language != nil ? " (CLI)" : fileConfig.language != nil ? " (config)" : " (default)")")
+    Log.status("  noMic        = \(resolved.noMic)\(noMic ? " (CLI)" : fileConfig.noMic == true ? " (config)" : " (default)")")
+    Log.status("  noSystem     = \(resolved.noSystem)\(noSystem ? " (CLI)" : fileConfig.noSystem == true ? " (config)" : " (default)")")
+    Log.status("  recordingsDir = \(resolved.recordingsDir)\(fileConfig.recordingDir != nil ? " (config)" : " (default)")")
+
+    return resolved
 }
 
 private func setupVerbose(_ global: GlobalOptions) {
