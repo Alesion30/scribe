@@ -21,7 +21,7 @@ struct Scribe: AsyncParsableCommand {
             then transcribe with a local whisper model. \
             Run without a subcommand to record and transcribe in one step.
             """,
-        version: "0.1.0",
+        version: "0.0.0",
         subcommands: [
             DefaultCommand.self,
             Record.self,
