@@ -132,6 +132,16 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             }
         }
 
+        // Normalize each source to the same level before mixing
+        // so quiet mic doesn't get buried by louder system audio.
+        let mixTarget: Float = 0.5
+        if !resampledMic.isEmpty {
+            resampledMic = AudioWriter.normalize(resampledMic, targetPeak: mixTarget)
+        }
+        if !resampledSystem.isEmpty {
+            resampledSystem = AudioWriter.normalize(resampledSystem, targetPeak: mixTarget)
+        }
+
         // Mix mic and system audio
         let mixed: [Float]
         if !resampledMic.isEmpty && !resampledSystem.isEmpty {
