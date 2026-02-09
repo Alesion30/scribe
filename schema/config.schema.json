@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scribe configuration",
+  "description": "Configuration file schema for the scribe CLI.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference URL."
+    },
+    "model": {
+      "type": "string",
+      "description": "Whisper model name or absolute path. When a name is given, scribe looks for ~/.scribe/models/{name}.bin.",
+      "default": "large-v3-turbo",
+      "examples": ["large-v3-turbo", "tiny", "/path/to/custom-model.bin"]
+    },
+    "recordingDir": {
+      "type": "string",
+      "description": "Default output directory for recordings. Defaults to ~/.scribe/recordings/.",
+      "default": "~/.scribe/recordings"
+    },
+    "language": {
+      "type": "string",
+      "description": "Language hint for transcription (ISO 639-1). Set to 'auto' for automatic detection.",
+      "examples": ["ja", "en", "zh"],
+      "default": "auto"
+    },
+    "noMic": {
+      "type": "boolean",
+      "description": "Disable microphone input and capture system audio only.",
+      "default": false
+    },
+    "noSystem": {
+      "type": "boolean",
+      "description": "Disable system audio and capture microphone input only.",
+      "default": false
+    }
+  },
+  "additionalProperties": false
+}
