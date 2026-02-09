@@ -146,12 +146,10 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             return []
         }
 
-        // Remove silence
-        let trimmed = AudioWriter.removeSilence(from: mixed)
-        let duration = Double(trimmed.count) / AudioWriter.sampleRate
-        Log.info("Final audio: \(trimmed.count) samples (\(String(format: "%.1f", duration))s)")
+        let duration = Double(mixed.count) / AudioWriter.sampleRate
+        Log.info("Final audio: \(mixed.count) samples (\(String(format: "%.1f", duration))s)")
 
-        return trimmed
+        return mixed
     }
 
     // MARK: - SCStreamOutput

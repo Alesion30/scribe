@@ -11,24 +11,45 @@ struct AudioWriter {
     // MARK: - Sample Extraction
 
     /// Convert a CMSampleBuffer to Float samples normalized to [-1, 1].
+    /// Returns interleaved samples when the source is multi-channel.
     static func extractSamples(from sampleBuffer: CMSampleBuffer) -> [Float]? {
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
-            Log.warning("No format description in sample buffer")
+            Log.debug("No format description in sample buffer")
             return nil
         }
         guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee else {
-            Log.warning("No audio stream basic description")
+            Log.debug("No audio stream basic description")
             return nil
         }
 
-        var blockBuffer: CMBlockBuffer?
-        var audioBufferList = AudioBufferList()
+        // Query the required AudioBufferList size first.
+        // Non-interleaved stereo needs space for 2 AudioBuffer entries,
+        // which exceeds MemoryLayout<AudioBufferList>.size (room for 1).
+        var bufferListSize: Int = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &bufferListSize,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: nil
+        )
 
+        let audioBufferListRaw = UnsafeMutableRawPointer.allocate(
+            byteCount: bufferListSize,
+            alignment: MemoryLayout<AudioBufferList>.alignment
+        )
+        defer { audioBufferListRaw.deallocate() }
+        let audioBufferListPtr = audioBufferListRaw.assumingMemoryBound(to: AudioBufferList.self)
+
+        var blockBuffer: CMBlockBuffer?
         let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
             sampleBuffer,
             bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
+            bufferListOut: audioBufferListPtr,
+            bufferListSize: bufferListSize,
             blockBufferAllocator: nil,
             blockBufferMemoryAllocator: nil,
             flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
@@ -36,24 +57,55 @@ struct AudioWriter {
         )
 
         guard status == noErr else {
-            Log.warning("Failed to get audio buffer list: \(status)")
+            Log.debug("Failed to get audio buffer list: \(status)")
             return nil
         }
 
-        let audioBuffer = audioBufferList.mBuffers
-        guard let data = audioBuffer.mData else {
-            Log.warning("Audio buffer has no data")
-            return nil
-        }
+        let bufferList = UnsafeMutableAudioBufferListPointer(audioBufferListPtr)
+        let isNonInterleaved = asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0
 
-        let frameCount = Int(audioBuffer.mDataByteSize) / MemoryLayout<Float>.size
+        if isNonInterleaved && bufferList.count > 1 {
+            // Non-interleaved: each AudioBuffer holds one channel.
+            // Extract per-channel data and interleave (L,R,L,R,...).
+            var channels: [[Float]] = []
+            for buffer in bufferList {
+                guard let data = buffer.mData else { continue }
+                guard let floats = convertToFloat(data: data, byteSize: Int(buffer.mDataByteSize), asbd: asbd) else {
+                    return nil
+                }
+                channels.append(floats)
+            }
+            guard !channels.isEmpty else { return nil }
+
+            let framesPerChannel = channels[0].count
+            let channelCount = channels.count
+            var interleaved = [Float](repeating: 0, count: framesPerChannel * channelCount)
+            for ch in 0..<channelCount {
+                for frame in 0..<framesPerChannel {
+                    interleaved[frame * channelCount + ch] = channels[ch][frame]
+                }
+            }
+            return interleaved
+        } else {
+            // Interleaved or single-channel: read from the first buffer.
+            guard let buffer = bufferList.first, let data = buffer.mData else {
+                Log.debug("Audio buffer has no data")
+                return nil
+            }
+            return convertToFloat(data: data, byteSize: Int(buffer.mDataByteSize), asbd: asbd)
+        }
+    }
+
+    /// Convert raw audio bytes to Float samples normalized to [-1, 1].
+    private static func convertToFloat(data: UnsafeMutableRawPointer, byteSize: Int, asbd: AudioStreamBasicDescription) -> [Float]? {
         if asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0 && asbd.mBitsPerChannel == 32 {
             // Float32 samples
-            let floatPtr = data.bindMemory(to: Float.self, capacity: frameCount)
-            return Array(UnsafeBufferPointer(start: floatPtr, count: frameCount))
+            let count = byteSize / MemoryLayout<Float>.size
+            let floatPtr = data.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: floatPtr, count: count))
         } else if asbd.mBitsPerChannel == 16 {
             // Int16 samples - convert to Float
-            let sampleCount = Int(audioBuffer.mDataByteSize) / MemoryLayout<Int16>.size
+            let sampleCount = byteSize / MemoryLayout<Int16>.size
             let int16Ptr = data.bindMemory(to: Int16.self, capacity: sampleCount)
             var floats = [Float](repeating: 0, count: sampleCount)
             vDSP_vflt16(int16Ptr, 1, &floats, 1, vDSP_Length(sampleCount))
@@ -62,7 +114,7 @@ struct AudioWriter {
             return floats
         } else if asbd.mBitsPerChannel == 32 && asbd.mFormatFlags & kAudioFormatFlagIsSignedInteger != 0 {
             // Int32 samples - convert to Float
-            let sampleCount = Int(audioBuffer.mDataByteSize) / MemoryLayout<Int32>.size
+            let sampleCount = byteSize / MemoryLayout<Int32>.size
             let int32Ptr = data.bindMemory(to: Int32.self, capacity: sampleCount)
             var floats = [Float](repeating: 0, count: sampleCount)
             vDSP_vflt32(int32Ptr, 1, &floats, 1, vDSP_Length(sampleCount))
@@ -71,7 +123,7 @@ struct AudioWriter {
             return floats
         }
 
-        Log.warning("Unsupported audio format: \(asbd.mBitsPerChannel)-bit, flags=\(asbd.mFormatFlags)")
+        Log.debug("Unsupported audio format: \(asbd.mBitsPerChannel)-bit, flags=\(asbd.mFormatFlags)")
         return nil
     }
 
@@ -177,7 +229,7 @@ struct AudioWriter {
 
     // MARK: - Mixing
 
-    /// Mix two audio buffers (e.g., microphone + system) by averaging.
+    /// Mix two audio buffers (e.g., microphone + system) by summing and clamping.
     /// The shorter buffer is padded with zeros. Output is clamped to [-1, 1].
     static func mix(_ bufferA: [Float], _ bufferB: [Float]) -> [Float] {
         if bufferA.isEmpty { return bufferB }
@@ -191,11 +243,9 @@ struct AudioWriter {
         if a.count < length { a.append(contentsOf: [Float](repeating: 0, count: length - a.count)) }
         if b.count < length { b.append(contentsOf: [Float](repeating: 0, count: length - b.count)) }
 
-        // Average using vDSP
+        // Sum using vDSP (no averaging — avoids halving when one source is silent)
         var result = [Float](repeating: 0, count: length)
         vDSP_vadd(a, 1, b, 1, &result, 1, vDSP_Length(length))
-        var divisor: Float = 2.0
-        vDSP_vsdiv(result, 1, &divisor, &result, 1, vDSP_Length(length))
 
         // Clamp to [-1, 1]
         var lowerBound: Float = -1.0
