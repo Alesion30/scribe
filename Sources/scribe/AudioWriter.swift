@@ -255,6 +255,169 @@ struct AudioWriter {
         return result
     }
 
+    // MARK: - Noise Reduction
+
+    /// Reduce background noise using spectral subtraction (Wiener filter).
+    /// Estimates the noise profile from the quietest frames, then attenuates
+    /// frequency bins dominated by noise while preserving speech.
+    static func reduceNoise(from samples: [Float]) -> [Float] {
+        let frameSize = 1024  // ~64ms at 16kHz
+        let hopSize = frameSize / 4  // 75% overlap
+        guard samples.count > frameSize else { return samples }
+
+        let log2n = vDSP_Length(log2(Double(frameSize)))
+        guard let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2)) else {
+            Log.debug("Failed to create FFT setup for noise reduction")
+            return samples
+        }
+        defer { vDSP_destroy_fftsetup(fftSetup) }
+
+        let halfN = frameSize / 2
+        let numFrames = (samples.count - frameSize) / hopSize + 1
+        guard numFrames > 0 else { return samples }
+
+        // Hann window
+        var window = [Float](repeating: 0, count: frameSize)
+        vDSP_hann_window(&window, vDSP_Length(frameSize), Int32(vDSP_HANN_NORM))
+
+        // --- Step 1: Forward FFT all frames, compute power spectra ---
+
+        struct FrameData {
+            var real: [Float]
+            var imag: [Float]
+            var power: [Float]
+            var totalPower: Float
+        }
+
+        var frames: [FrameData] = []
+        frames.reserveCapacity(numFrames)
+
+        for i in 0..<numFrames {
+            let offset = i * hopSize
+
+            // Extract and window
+            var frame = [Float](repeating: 0, count: frameSize)
+            let copyEnd = min(offset + frameSize, samples.count)
+            for j in offset..<copyEnd {
+                frame[j - offset] = samples[j] * window[j - offset]
+            }
+
+            // Pack into split complex for vDSP_fft_zrip
+            var real = [Float](repeating: 0, count: halfN)
+            var imag = [Float](repeating: 0, count: halfN)
+            for j in 0..<halfN {
+                real[j] = frame[2 * j]
+                imag[j] = frame[2 * j + 1]
+            }
+
+            // Forward FFT
+            real.withUnsafeMutableBufferPointer { rBuf in
+                imag.withUnsafeMutableBufferPointer { iBuf in
+                    var split = DSPSplitComplex(realp: rBuf.baseAddress!, imagp: iBuf.baseAddress!)
+                    vDSP_fft_zrip(fftSetup, &split, 1, log2n, FFTDirection(FFT_FORWARD))
+                }
+            }
+
+            // Power spectrum: power[j] = real[j]^2 + imag[j]^2
+            var power = [Float](repeating: 0, count: halfN)
+            real.withUnsafeMutableBufferPointer { rBuf in
+                imag.withUnsafeMutableBufferPointer { iBuf in
+                    var split = DSPSplitComplex(realp: rBuf.baseAddress!, imagp: iBuf.baseAddress!)
+                    vDSP_zvmags(&split, 1, &power, 1, vDSP_Length(halfN))
+                }
+            }
+
+            var totalPower: Float = 0
+            vDSP_sve(power, 1, &totalPower, vDSP_Length(halfN))
+
+            frames.append(FrameData(real: real, imag: imag, power: power, totalPower: totalPower))
+        }
+
+        // --- Step 2: Estimate noise power from the quietest 15% of frames ---
+
+        let sortedPowers = frames.map(\.totalPower).sorted()
+        let noiseFrameCount = max(1, numFrames * 15 / 100)
+        let noiseThreshold = sortedPowers[min(noiseFrameCount, sortedPowers.count) - 1]
+
+        var noisePower = [Float](repeating: 0, count: halfN)
+        var noiseCount: Float = 0
+        for frame in frames where frame.totalPower <= noiseThreshold {
+            vDSP_vadd(noisePower, 1, frame.power, 1, &noisePower, 1, vDSP_Length(halfN))
+            noiseCount += 1
+        }
+        if noiseCount > 0 {
+            var d = noiseCount
+            vDSP_vsdiv(noisePower, 1, &d, &noisePower, 1, vDSP_Length(halfN))
+        }
+
+        // Over-estimate noise for more aggressive reduction
+        var noiseScale: Float = 2.0
+        vDSP_vsmul(noisePower, 1, &noiseScale, &noisePower, 1, vDSP_Length(halfN))
+
+        // --- Step 3: Apply Wiener gain and inverse FFT ---
+
+        let spectralFloor: Float = 0.05  // minimum gain to avoid musical noise artifacts
+        var output = [Float](repeating: 0, count: samples.count)
+        var windowSum = [Float](repeating: 0, count: samples.count)
+
+        for (i, frameData) in frames.enumerated() {
+            let offset = i * hopSize
+            var real = frameData.real
+            var imag = frameData.imag
+
+            // Per-bin Wiener gain: max(floor, 1 - noisePower / signalPower)
+            for j in 0..<halfN {
+                let gain: Float
+                if frameData.power[j] > 0 {
+                    gain = max(spectralFloor, 1.0 - noisePower[j] / frameData.power[j])
+                } else {
+                    gain = spectralFloor
+                }
+                real[j] *= gain
+                imag[j] *= gain
+            }
+
+            // Inverse FFT
+            real.withUnsafeMutableBufferPointer { rBuf in
+                imag.withUnsafeMutableBufferPointer { iBuf in
+                    var split = DSPSplitComplex(realp: rBuf.baseAddress!, imagp: iBuf.baseAddress!)
+                    vDSP_fft_zrip(fftSetup, &split, 1, log2n, FFTDirection(FFT_INVERSE))
+                }
+            }
+
+            // Unpack split complex → real signal
+            var frame = [Float](repeating: 0, count: frameSize)
+            for j in 0..<halfN {
+                frame[2 * j] = real[j]
+                frame[2 * j + 1] = imag[j]
+            }
+
+            // Scale: vDSP round-trip gain is N/2
+            var scale = 1.0 / Float(halfN)
+            vDSP_vsmul(frame, 1, &scale, &frame, 1, vDSP_Length(frameSize))
+
+            // Apply window for overlap-add
+            vDSP_vmul(frame, 1, window, 1, &frame, 1, vDSP_Length(frameSize))
+
+            // Overlap-add
+            let end = min(offset + frameSize, samples.count)
+            for j in 0..<(end - offset) {
+                output[offset + j] += frame[j]
+                windowSum[offset + j] += window[j] * window[j]
+            }
+        }
+
+        // Normalize by accumulated window energy (COLA)
+        for i in 0..<output.count {
+            if windowSum[i] > 1e-8 {
+                output[i] /= windowSum[i]
+            }
+        }
+
+        Log.debug("Noise reduction: \(numFrames) frames processed, noise estimated from \(Int(noiseCount)) frames")
+        return output
+    }
+
     // MARK: - Normalization
 
     /// Peak-normalize samples so the loudest peak reaches `targetPeak`.

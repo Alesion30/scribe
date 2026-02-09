@@ -146,8 +146,11 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             return []
         }
 
+        // Reduce background noise before amplification
+        let denoised = AudioWriter.reduceNoise(from: mixed)
+
         // Normalize volume (peak → 0.9 to leave headroom)
-        let normalized = AudioWriter.normalize(mixed)
+        let normalized = AudioWriter.normalize(denoised)
 
         let duration = Double(normalized.count) / AudioWriter.sampleRate
         Log.info("Final audio: \(normalized.count) samples (\(String(format: "%.1f", duration))s)")
