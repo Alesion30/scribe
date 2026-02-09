@@ -255,6 +255,32 @@ struct AudioWriter {
         return result
     }
 
+    // MARK: - Normalization
+
+    /// Peak-normalize samples so the loudest peak reaches `targetPeak`.
+    /// Leaves headroom to avoid clipping. No-op if the signal is already louder.
+    static func normalize(_ samples: [Float], targetPeak: Float = 0.9) -> [Float] {
+        guard !samples.isEmpty else { return [] }
+
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+
+        guard peak > 0 else { return samples }
+
+        let gain = targetPeak / peak
+        if gain <= 1.0 {
+            Log.debug("Peak \(String(format: "%.4f", peak)) already above target, skipping normalization")
+            return samples
+        }
+
+        var result = [Float](repeating: 0, count: samples.count)
+        var g = gain
+        vDSP_vsmul(samples, 1, &g, &result, 1, vDSP_Length(samples.count))
+
+        Log.debug("Normalized: peak \(String(format: "%.4f", peak)) → \(String(format: "%.4f", targetPeak)) (gain: \(String(format: "%.1f", gain))x)")
+        return result
+    }
+
     // MARK: - Silence Removal
 
     /// Remove silence segments based on RMS threshold.

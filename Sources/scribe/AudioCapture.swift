@@ -146,10 +146,13 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             return []
         }
 
-        let duration = Double(mixed.count) / AudioWriter.sampleRate
-        Log.info("Final audio: \(mixed.count) samples (\(String(format: "%.1f", duration))s)")
+        // Normalize volume (peak → 0.9 to leave headroom)
+        let normalized = AudioWriter.normalize(mixed)
 
-        return mixed
+        let duration = Double(normalized.count) / AudioWriter.sampleRate
+        Log.info("Final audio: \(normalized.count) samples (\(String(format: "%.1f", duration))s)")
+
+        return normalized
     }
 
     // MARK: - SCStreamOutput
