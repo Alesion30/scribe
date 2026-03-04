@@ -1,6 +1,7 @@
 @preconcurrency import ScreenCaptureKit
 import AVFoundation
 import CoreMedia
+import Accelerate
 
 /// Captures microphone and/or system audio using ScreenCaptureKit (macOS 15+).
 final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
@@ -129,6 +130,33 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
                 Log.debug("Resampled system: \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
             } else {
                 Log.warning("Failed to resample system audio")
+            }
+        }
+
+        // Detect near-silent sources and exclude them from the mix.
+        // Prevents amplifying system noise during offline meetings
+        // (where no meaningful system audio exists) and vice versa.
+        let silenceRMSThreshold: Float = 0.01
+        if !resampledSystem.isEmpty {
+            var sumSq: Float = 0
+            vDSP_svesq(resampledSystem, 1, &sumSq, vDSP_Length(resampledSystem.count))
+            let rms = sqrtf(sumSq / Float(resampledSystem.count))
+            if rms < silenceRMSThreshold {
+                Log.info("System audio is near-silent (RMS=\(String(format: "%.5f", rms))), excluding from mix")
+                resampledSystem = []
+            } else {
+                Log.debug("System audio RMS: \(String(format: "%.5f", rms))")
+            }
+        }
+        if !resampledMic.isEmpty {
+            var sumSq: Float = 0
+            vDSP_svesq(resampledMic, 1, &sumSq, vDSP_Length(resampledMic.count))
+            let rms = sqrtf(sumSq / Float(resampledMic.count))
+            if rms < silenceRMSThreshold {
+                Log.info("Mic audio is near-silent (RMS=\(String(format: "%.5f", rms))), excluding from mix")
+                resampledMic = []
+            } else {
+                Log.debug("Mic audio RMS: \(String(format: "%.5f", rms))")
             }
         }
 
