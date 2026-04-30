@@ -28,7 +28,8 @@ let package = Package(
         ),
         .testTarget(
             name: "scribeTests",
-            dependencies: ["scribe"]
+            dependencies: ["scribe"],
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

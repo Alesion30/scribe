@@ -3,17 +3,32 @@ import AVFoundation
 import CoreMedia
 import Accelerate
 
-/// Captures microphone and/or system audio using ScreenCaptureKit (macOS 15+).
+/// Captures microphone (via AVAudioEngine) and/or system audio (via ScreenCaptureKit).
+///
+/// Microphone capture deliberately does NOT go through ScreenCaptureKit:
+/// running a display-scoped SCStream blocks other apps (e.g. Google Meet)
+/// from initiating screen sharing while scribe is recording. By isolating
+/// mic capture to AVAudioEngine, mic-only sessions touch ScreenCaptureKit
+/// not at all, and mic+system sessions only run an audio-only SCStream.
 final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let captureMic: Bool
     let captureSystem: Bool
 
+    // ScreenCaptureKit — system audio only
     private var stream: SCStream?
-    private var micSamples: [Float] = []
     private var systemSamples: [Float] = []
-    private var continuation: CheckedContinuation<Void, any Error>?
     private var sourceSampleRate: Double = 48000
+
+    // AVAudioEngine — microphone
+    private var audioEngine: AVAudioEngine?
+    private var micSamples: [Float] = []
     private var micSampleRate: Double = 48000
+    private var micChannelCount: Int = 1
+
+    private var continuation: CheckedContinuation<Void, any Error>?
+
+    // Mic and system audio arrive on independent threads — guard the buffers.
+    private let samplesLock = NSLock()
 
     init(captureMic: Bool = true, captureSystem: Bool = true) {
         self.captureMic = captureMic
@@ -27,59 +42,13 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     func startCapture() async throws {
         Log.info("Starting audio capture (mic: \(captureMic), system: \(captureSystem))")
 
-        let content: SCShareableContent
-        do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        } catch {
-            handlePermissionError(error)
-            throw error
+        if captureMic {
+            try startMicrophoneCapture()
         }
-
-        guard let display = content.displays.first else {
-            throw AudioCaptureError.noDisplayFound
-        }
-        Log.debug("Using display: \(display.width)x\(display.height)")
-
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-
-        let config = SCStreamConfiguration()
-        config.capturesAudio = captureSystem
-        config.excludesCurrentProcessAudio = true
-        config.channelCount = 2
-        config.captureMicrophone = captureMic
-
-        // System audio sample rate (mic uses device native rate, read from CMSampleBuffer)
-        config.sampleRate = 48000
-        sourceSampleRate = 48000
-        Log.debug("System audio sample rate: \(sourceSampleRate) Hz")
-
-        // We don't need video
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1) // 1 FPS minimum
-
-        let captureStream = SCStream(filter: filter, configuration: config, delegate: self)
-        self.stream = captureStream
-
-        let queue = DispatchQueue(label: "com.scribe.audio-capture", qos: .userInitiated)
 
         if captureSystem {
-            try captureStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-            Log.debug("Added system audio output")
+            try await startSystemAudioCapture()
         }
-        if captureMic {
-            try captureStream.addStreamOutput(self, type: .microphone, sampleHandlerQueue: queue)
-            Log.debug("Added microphone output")
-        }
-
-        do {
-            try await captureStream.startCapture()
-        } catch {
-            handlePermissionError(error)
-            throw error
-        }
-
-        Log.info("Audio capture started")
 
         // Suspend until stopCapture() resumes the continuation
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
@@ -91,7 +60,14 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     func stopCapture() -> [Float] {
         Log.info("Stopping audio capture...")
 
-        // Stop the stream
+        // Stop microphone (AVAudioEngine)
+        if let engine = self.audioEngine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        self.audioEngine = nil
+
+        // Stop system audio stream (ScreenCaptureKit)
         if let stream = self.stream {
             // Fire and forget the async stop - samples are already captured
             let streamToStop = stream
@@ -109,23 +85,28 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         continuation?.resume()
         continuation = nil
 
-        Log.debug("Raw samples - mic: \(micSamples.count), system: \(systemSamples.count)")
+        samplesLock.lock()
+        let rawMic = micSamples
+        let rawSystem = systemSamples
+        samplesLock.unlock()
+
+        Log.debug("Raw samples - mic: \(rawMic.count), system: \(rawSystem.count)")
 
         // Resample both streams to 16kHz mono
         var resampledMic: [Float] = []
         var resampledSystem: [Float] = []
 
-        if !micSamples.isEmpty {
-            if let resampled = AudioWriter.resample(micSamples, fromRate: micSampleRate, channels: 1) {
+        if !rawMic.isEmpty {
+            if let resampled = AudioWriter.resample(rawMic, fromRate: micSampleRate, channels: micChannelCount) {
                 resampledMic = resampled
-                Log.debug("Resampled mic (\(micSampleRate) Hz -> 16 kHz): \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
+                Log.debug("Resampled mic (\(micSampleRate) Hz, \(micChannelCount)ch -> 16 kHz mono): \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
             } else {
                 Log.warning("Failed to resample microphone audio")
             }
         }
 
-        if !systemSamples.isEmpty {
-            if let resampled = AudioWriter.resample(systemSamples, fromRate: sourceSampleRate, channels: 2) {
+        if !rawSystem.isEmpty {
+            if let resampled = AudioWriter.resample(rawSystem, fromRate: sourceSampleRate, channels: 2) {
                 resampledSystem = resampled
                 Log.debug("Resampled system: \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
             } else {
@@ -196,38 +177,144 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         return normalized
     }
 
+    // MARK: - Microphone (AVAudioEngine)
+
+    private func startMicrophoneCapture() throws {
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+
+        guard format.sampleRate > 0 else {
+            throw AudioCaptureError.invalidMicrophoneFormat
+        }
+
+        micSampleRate = format.sampleRate
+        micChannelCount = Int(format.channelCount)
+        Log.debug("Microphone format: \(micSampleRate) Hz, \(micChannelCount) channel(s)")
+
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            self?.handleMicBuffer(buffer)
+        }
+
+        engine.prepare()
+
+        do {
+            try engine.start()
+        } catch {
+            inputNode.removeTap(onBus: 0)
+            handleMicrophonePermissionError(error)
+            throw error
+        }
+
+        self.audioEngine = engine
+        Log.info("Microphone capture started (AVAudioEngine)")
+    }
+
+    private func handleMicBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData else { return }
+        let frameCount = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        guard frameCount > 0, channels > 0 else { return }
+
+        let samples: [Float]
+        if channels == 1 {
+            samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
+        } else {
+            // Interleave (L,R,L,R,...) so AudioWriter.resample can deinterleave.
+            var interleaved = [Float](repeating: 0, count: frameCount * channels)
+            for ch in 0..<channels {
+                let src = channelData[ch]
+                for frame in 0..<frameCount {
+                    interleaved[frame * channels + ch] = src[frame]
+                }
+            }
+            samples = interleaved
+        }
+
+        samplesLock.lock()
+        micSamples.append(contentsOf: samples)
+        let total = micSamples.count
+        samplesLock.unlock()
+
+        if total % 100000 < frameCount * channels {
+            Log.debug("Mic audio: \(total) samples buffered (\(micSampleRate) Hz)")
+        }
+    }
+
+    // MARK: - System Audio (ScreenCaptureKit)
+
+    private func startSystemAudioCapture() async throws {
+        let content: SCShareableContent
+        do {
+            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        } catch {
+            handlePermissionError(error)
+            throw error
+        }
+
+        guard let display = content.displays.first else {
+            throw AudioCaptureError.noDisplayFound
+        }
+        Log.debug("Using display: \(display.width)x\(display.height)")
+
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.excludesCurrentProcessAudio = true
+        config.channelCount = 2
+        // Mic is captured via AVAudioEngine — keep ScreenCaptureKit audio-only.
+        config.captureMicrophone = false
+
+        config.sampleRate = 48000
+        sourceSampleRate = 48000
+        Log.debug("System audio sample rate: \(sourceSampleRate) Hz")
+
+        // We don't need video
+        config.width = 2
+        config.height = 2
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1) // 1 FPS minimum
+
+        let captureStream = SCStream(filter: filter, configuration: config, delegate: self)
+        self.stream = captureStream
+
+        let queue = DispatchQueue(label: "com.scribe.audio-capture", qos: .userInitiated)
+        try captureStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+        Log.debug("Added system audio output")
+
+        do {
+            try await captureStream.startCapture()
+        } catch {
+            handlePermissionError(error)
+            throw error
+        }
+
+        Log.info("System audio capture started (ScreenCaptureKit)")
+    }
+
     // MARK: - SCStreamOutput
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard sampleBuffer.isValid else { return }
 
-        // Only process audio types
-        guard type == .audio || type == .microphone else { return }
+        // Mic comes from AVAudioEngine; only system audio flows through SCStream now.
+        guard type == .audio else { return }
 
         guard let samples = AudioWriter.extractSamples(from: sampleBuffer) else { return }
 
-        // Read actual sample rate from the buffer's format description
         var bufferSampleRate = sourceSampleRate
         if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
             bufferSampleRate = asbd.pointee.mSampleRate
         }
 
-        switch type {
-        case .audio:
-            systemSamples.append(contentsOf: samples)
-            if systemSamples.count % 100000 < samples.count {
-                Log.debug("System audio: \(systemSamples.count) samples buffered (\(bufferSampleRate) Hz)")
-            }
-        case .microphone:
-            // Store mic sample rate - it may differ from system audio
-            micSampleRate = bufferSampleRate
-            micSamples.append(contentsOf: samples)
-            if micSamples.count % 100000 < samples.count {
-                Log.debug("Mic audio: \(micSamples.count) samples buffered (\(bufferSampleRate) Hz)")
-            }
-        default:
-            break
+        samplesLock.lock()
+        systemSamples.append(contentsOf: samples)
+        let total = systemSamples.count
+        samplesLock.unlock()
+
+        if total % 100000 < samples.count {
+            Log.debug("System audio: \(total) samples buffered (\(bufferSampleRate) Hz)")
         }
     }
 
@@ -254,17 +341,31 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             Log.status("Then enable access for your terminal application (e.g., Terminal, iTerm2).")
         }
     }
+
+    private func handleMicrophonePermissionError(_ error: any Error) {
+        let nsError = error as NSError
+        let description = nsError.localizedDescription.lowercased()
+        if description.contains("permission") || description.contains("microphone") || nsError.code == 561017449 {
+            Log.error("Microphone permission denied.")
+            Log.status("To grant permission, open:")
+            Log.status("  System Settings > Privacy & Security > Microphone")
+            Log.status("Then enable access for your terminal application (e.g., Terminal, iTerm2).")
+        }
+    }
 }
 
 // MARK: - Errors
 
 enum AudioCaptureError: LocalizedError {
     case noDisplayFound
+    case invalidMicrophoneFormat
 
     var errorDescription: String? {
         switch self {
         case .noDisplayFound:
             return "No display found for audio capture"
+        case .invalidMicrophoneFormat:
+            return "Microphone returned an invalid audio format (sample rate is 0)"
         }
     }
 }

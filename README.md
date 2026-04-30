@@ -175,6 +175,45 @@ Grant access to your terminal application (Terminal, iTerm2, etc.).
 
 All models are available from [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp/tree/main). Use the `ggml-*.bin` files.
 
+## Development
+
+### Tests
+
+Unit and integration tests live under `Tests/scribeTests/`.
+
+```bash
+# Run the full test suite (unit + integration)
+swift test
+```
+
+The integration suite (`TranscriptionIntegrationTests`) feeds Japanese WAV fixtures through the real `WhisperContext` to catch regressions in the transcription pipeline. It is **automatically skipped** when the configured whisper model is not present locally, so a fresh checkout does not fail.
+
+Override the model used by integration tests:
+
+```bash
+SCRIBE_TEST_MODEL=base swift test
+```
+
+### Smoke Test
+
+A one-shot script that builds the release binary and verifies a known fixture transcribes correctly:
+
+```bash
+./scripts/smoke.sh                                    # default: weather sample, looks for 「天気」
+./scripts/smoke.sh -f path/to.wav -k expected_word    # override fixture and keyword
+./scripts/smoke.sh -h                                 # help
+```
+
+### Regenerating Fixtures
+
+Fixtures are committed under `Tests/scribeTests/Fixtures/`. To regenerate them with macOS `say` (Kyoko voice):
+
+```bash
+./scripts/generate-fixtures.sh
+```
+
+This writes 16 kHz mono 16-bit WAV files matching scribe's transcription pipeline format. Regeneration may produce slightly different byte sequences depending on macOS version.
+
 ## Architecture
 
 scribe is built with:
