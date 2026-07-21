@@ -31,6 +31,51 @@ enum ModelManager {
         return (ScribeConfig.modelsDir as NSString).appendingPathComponent("\(name).bin")
     }
 
+    // MARK: - Known Models
+
+    /// Standard whisper.cpp models downloadable by name alone, with approximate sizes.
+    static let knownModels: [(name: String, approxSize: String)] = [
+        ("tiny", "74 MB"),
+        ("base", "141 MB"),
+        ("small", "465 MB"),
+        ("medium", "1.4 GB"),
+        ("large-v3-turbo", "1.5 GB"),
+        ("large-v3", "2.9 GB"),
+    ]
+
+    /// Download URL for a known model name, or nil if the name is not a standard model.
+    static func knownModelURL(for name: String) -> URL? {
+        guard knownModels.contains(where: { $0.name == name }) else { return nil }
+        return URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-\(name).bin")
+    }
+
+    /// Resolve a model to a local file path, downloading known models that are missing.
+    /// Prompts for confirmation when stdin is a terminal.
+    static func ensureModel(_ nameOrPath: String) async throws -> String {
+        let path = resolveModelPath(nameOrPath)
+        if FileManager.default.fileExists(atPath: path) {
+            return path
+        }
+
+        guard let url = knownModelURL(for: nameOrPath) else {
+            throw ModelManagerError.modelFileMissing(nameOrPath, path)
+        }
+
+        let size = knownModels.first { $0.name == nameOrPath }?.approxSize ?? "?"
+        if isatty(STDIN_FILENO) != 0 {
+            FileHandle.standardError.write(Data("Model '\(nameOrPath)' is not downloaded (\(size)). Download now? [Y/n] ".utf8))
+            let answer = (readLine() ?? "").trimmingCharacters(in: .whitespaces).lowercased()
+            if answer == "n" || answer == "no" {
+                throw ModelManagerError.downloadDeclined(nameOrPath)
+            }
+        } else {
+            Log.status("Model '\(nameOrPath)' is not downloaded (\(size)). Downloading...")
+        }
+
+        try await download(name: nameOrPath, url: url)
+        return path
+    }
+
     // MARK: - Download
 
     /// Download a model from the given URL and save it to the models directory.
@@ -159,11 +204,22 @@ enum ModelManager {
 
 enum ModelManagerError: LocalizedError {
     case modelNotFound(String)
+    case modelFileMissing(String, String)
+    case downloadDeclined(String)
 
     var errorDescription: String? {
         switch self {
         case .modelNotFound(let name):
             return "Model '\(name)' not found in \(ScribeConfig.modelsDir)"
+        case .modelFileMissing(let name, let path):
+            let known = ModelManager.knownModels.map(\.name).joined(separator: ", ")
+            return """
+                Model '\(name)' not found at \(path)
+                Standard models (\(known)) can be downloaded with: scribe model download <name>
+                For other models, specify a URL: scribe model download \(name) -u <url>
+                """
+        case .downloadDeclined(let name):
+            return "Download declined. Download it later with: scribe model download \(name)"
         }
     }
 }

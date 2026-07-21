@@ -65,6 +65,10 @@ extension Scribe {
         mutating func run() async throws {
             let config = try resolveConfig(global: global, model: model, language: language, noMic: noMic, noSystem: noSystem)
 
+            // Ensure the model exists before recording so a missing model
+            // (or a declined download) doesn't waste a recording session.
+            _ = try await ModelManager.ensureModel(config.model)
+
             // Record
             let (samples, wavFile) = try await performRecording(
                 captureMic: !config.noMic,
@@ -78,7 +82,7 @@ extension Scribe {
             }
 
             // Transcribe
-            let text = try performTranscription(
+            let text = try await performTranscription(
                 samples: samples,
                 modelName: config.model,
                 language: config.language
@@ -164,7 +168,7 @@ extension Scribe {
             let samples = try AudioWriter.readWAV(from: path)
             Log.info("Read \(samples.count) samples (\(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s)")
 
-            let text = try performTranscription(
+            let text = try await performTranscription(
                 samples: samples,
                 modelName: config.model,
                 language: config.language
@@ -198,14 +202,22 @@ extension Scribe.Model {
         @Argument(help: "Model name (saved as ~/.scribe/models/<name>.bin).")
         var name: String
 
-        @Option(name: .shortAndLong, help: "Download URL for the model file.")
-        var url: String
+        @Option(name: .shortAndLong, help: "Download URL for the model file (optional for standard models).")
+        var url: String?
 
         mutating func run() async throws {
             setupVerbose(global)
 
-            guard let downloadURL = URL(string: url) else {
-                throw ScribeError.invalidURL(url)
+            let downloadURL: URL
+            if let url {
+                guard let parsed = URL(string: url) else {
+                    throw ScribeError.invalidURL(url)
+                }
+                downloadURL = parsed
+            } else if let known = ModelManager.knownModelURL(for: name) {
+                downloadURL = known
+            } else {
+                throw ScribeError.unknownModel(name)
             }
 
             try await ModelManager.download(name: name, url: downloadURL)
@@ -226,7 +238,7 @@ extension Scribe.Model {
 
             if models.isEmpty {
                 Log.status("No models found in \(ScribeConfig.modelsDir)")
-                Log.status("Download a model with: scribe model download <name> -u <url>")
+                Log.status("Download a model with: scribe model download <name>")
                 return
             }
 
@@ -370,16 +382,13 @@ private func performRecording(
 }
 
 /// Transcribe audio samples using whisper.cpp.
+/// Downloads the model first if it is a known model that hasn't been fetched yet.
 private func performTranscription(
     samples: [Float],
     modelName: String,
     language: String
-) throws -> String {
-    let modelPath = ModelManager.resolveModelPath(modelName)
-
-    guard FileManager.default.fileExists(atPath: modelPath) else {
-        throw ScribeError.modelNotFound(modelName, modelPath)
-    }
+) async throws -> String {
+    let modelPath = try await ModelManager.ensureModel(modelName)
 
     Log.status("Loading model: \(modelName)")
     let whisper = try WhisperContext(modelPath: modelPath)
@@ -410,7 +419,7 @@ private func writeOutput(_ text: String, to path: String) throws {
 enum ScribeError: LocalizedError {
     case noAudioCaptured
     case fileNotFound(String)
-    case modelNotFound(String, String)
+    case unknownModel(String)
     case invalidURL(String)
 
     var errorDescription: String? {
@@ -419,10 +428,11 @@ enum ScribeError: LocalizedError {
             return "No audio was captured during the recording session"
         case .fileNotFound(let path):
             return "File not found: \(path)"
-        case .modelNotFound(let name, let path):
+        case .unknownModel(let name):
+            let known = ModelManager.knownModels.map(\.name).joined(separator: ", ")
             return """
-                Model '\(name)' not found at \(path)
-                Download it with: scribe model download \(name) -u <url>
+                Unknown model '\(name)'. Standard models: \(known)
+                For other models, specify a URL with: scribe model download \(name) -u <url>
                 """
         case .invalidURL(let url):
             return "Invalid URL: \(url)"

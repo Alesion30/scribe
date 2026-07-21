@@ -34,16 +34,19 @@ cp .build/release/scribe /usr/local/bin/
 
 ### Download a Model
 
-scribe requires a whisper.cpp compatible model (GGML format). Download one before first use:
+scribe requires a whisper.cpp compatible model (GGML format). On first run, if the configured model is a standard one (see [Available Models](#available-models)) and hasn't been downloaded yet, scribe offers to download it automatically — no manual setup needed.
+
+To download a model ahead of time:
 
 ```bash
-# Recommended for most users (~809 MB, best speed/accuracy balance)
-scribe model download large-v3-turbo \
-  -u https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin
+# Standard models need no URL (default: large-v3-turbo, ~1.5 GB)
+scribe model download large-v3-turbo
 
-# Lightweight alternative (~142 MB, faster but less accurate)
-scribe model download base \
-  -u https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+# Lightweight alternative (~141 MB, faster but less accurate)
+scribe model download base
+
+# Custom models can be fetched from any URL
+scribe model download my-model -u https://example.com/ggml-my-model.bin
 ```
 
 Models are saved to `~/.scribe/models/`.
@@ -95,7 +98,10 @@ scribe transcribe recording.wav -m large-v3-turbo -l ja
 # List downloaded models
 scribe model list
 
-# Download a model
+# Download a standard model by name
+scribe model download <name>
+
+# Download a custom model from a URL
 scribe model download <name> -u <url>
 
 # Remove a model
@@ -166,14 +172,14 @@ Grant access to your terminal application (Terminal, iTerm2, etc.).
 
 | Model | Size | Description |
 |---|---|---|
-| `tiny` | ~75 MB | Fastest, least accurate |
-| `base` | ~142 MB | Good for quick tests |
-| `small` | ~466 MB | Balanced |
-| `medium` | ~1.5 GB | More accurate |
-| `large-v3-turbo` | ~809 MB | Best speed/accuracy tradeoff (default) |
-| `large-v3` | ~1.5 GB | Most accurate |
+| `tiny` | ~74 MB | Fastest, least accurate |
+| `base` | ~141 MB | Good for quick tests |
+| `small` | ~465 MB | Balanced |
+| `medium` | ~1.4 GB | More accurate |
+| `large-v3-turbo` | ~1.5 GB | Best speed/accuracy tradeoff (default) |
+| `large-v3` | ~2.9 GB | Most accurate |
 
-All models are available from [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp/tree/main). Use the `ggml-*.bin` files.
+These standard models can be downloaded by name alone (`scribe model download <name>`); they are hosted on [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp/tree/main) as `ggml-*.bin` files.
 
 ## Architecture
 
