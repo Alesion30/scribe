@@ -21,9 +21,12 @@ jobs:
       - name: Prepare artifact
         run: |
           BINARY=".build/${{ matrix.arch }}-apple-macosx/release/scribe"
+          FRAMEWORK=$(find .build/artifacts -type d -path '*whisper.xcframework/macos-*/whisper.framework')
+          test -d "$FRAMEWORK"
           ARTIFACT="scribe-macos-${{ matrix.arch }}"
           mkdir -p "$ARTIFACT"
           cp "$BINARY" "$ARTIFACT/scribe"
+          cp -R "$FRAMEWORK" "$ARTIFACT/whisper.framework"
           tar czf "${ARTIFACT}.tar.gz" "$ARTIFACT"
 
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

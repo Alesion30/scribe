@@ -18,6 +18,17 @@ A macOS command-line tool that captures audio from the microphone and/or system 
 
 ## Installation
 
+### Prebuilt Binary
+
+Download `scribe-macos-<arch>.tar.gz` from the [releases page](https://github.com/your-username/scribe/releases). The tarball is self-contained — it bundles `whisper.framework`, so extracting it is all you need:
+
+```bash
+tar xzf scribe-macos-arm64.tar.gz
+./scribe-macos-arm64/scribe --help
+```
+
+The binary looks up `whisper.framework` relative to its own location (`@loader_path`), so keep them in the same directory when moving them.
+
 ### Build from Source
 
 ```bash
