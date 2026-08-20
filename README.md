@@ -168,6 +168,14 @@ All fields are optional. A JSON Schema is available at [`schema/config.schema.js
     └── 2025-01-15_14-30-00.wav
 ```
 
+Recording filenames are stamped with the time the recording **started**, so the
+name identifies the session even for long recordings. `scribe` prints the full
+span when it saves the file:
+
+```
+Recording saved to: ~/.scribe/recordings/2025-01-15_14-30-00.wav (14:30:00 → 16:37:48, 2h 7m 48s)
+```
+
 ## Permissions
 
 On first run, macOS will prompt for the following permissions:

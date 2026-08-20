@@ -70,20 +70,20 @@ extension Scribe {
             _ = try await ModelManager.ensureModel(config.model)
 
             // Record
-            let (samples, wavFile) = try await performRecording(
+            let recording = try await performRecording(
                 captureMic: !config.noMic,
                 captureSystem: !config.noSystem,
                 wavPath: wavPath,
                 config: config
             )
 
-            guard !samples.isEmpty else {
+            guard !recording.samples.isEmpty else {
                 throw ScribeError.noAudioCaptured
             }
 
             // Transcribe
             let text = try await performTranscription(
-                samples: samples,
+                samples: recording.samples,
                 modelName: config.model,
                 language: config.language
             )
@@ -91,8 +91,8 @@ extension Scribe {
             // Output
             try writeOutput(text, to: output)
 
-            if let wav = wavFile {
-                Log.status("Recording saved to: \(wav)")
+            if let wav = recording.wavPath {
+                Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
             }
         }
     }
@@ -120,15 +120,15 @@ extension Scribe {
         mutating func run() async throws {
             let config = try resolveConfig(global: global, noMic: noMic, noSystem: noSystem)
 
-            let (_, wavFile) = try await performRecording(
+            let recording = try await performRecording(
                 captureMic: !config.noMic,
                 captureSystem: !config.noSystem,
                 wavPath: output,
                 config: config
             )
 
-            if let wav = wavFile {
-                Log.status("Recording saved to: \(wav)")
+            if let wav = recording.wavPath {
+                Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
             }
         }
     }
@@ -321,13 +321,48 @@ private func setupVerbose(_ global: GlobalOptions) {
     Log.verbose = global.verbose
 }
 
-/// Record audio, save WAV, return (samples, wavPath).
+/// A finished recording session and the wall-clock span it covered.
+private struct RecordingResult {
+    let samples: [Float]
+    /// nil when nothing was captured and no file was written.
+    let wavPath: String?
+    let startedAt: Date
+    let endedAt: Date
+
+    /// Span for the "saved to" line, e.g. "10:01:33 → 12:09:21, 2h 7m 48s".
+    var spanDescription: String {
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm:ss"
+        let elapsed = max(0, Int(endedAt.timeIntervalSince(startedAt).rounded()))
+        return "\(clock.string(from: startedAt)) → \(clock.string(from: endedAt)), \(formatDuration(elapsed))"
+    }
+}
+
+/// Build the default WAV path, named for when the recording started.
+func defaultWavPath(startedAt: Date, in directory: String) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+    return (directory as NSString).appendingPathComponent("\(formatter.string(from: startedAt)).wav")
+}
+
+/// Render a duration as "2h 7m 48s", dropping units that would lead with zero.
+func formatDuration(_ seconds: Int) -> String {
+    let hours = seconds / 3600
+    let minutes = (seconds % 3600) / 60
+    let remainder = seconds % 60
+
+    if hours > 0 { return "\(hours)h \(minutes)m \(remainder)s" }
+    if minutes > 0 { return "\(minutes)m \(remainder)s" }
+    return "\(remainder)s"
+}
+
+/// Record audio, save WAV, return the session result.
 private func performRecording(
     captureMic: Bool,
     captureSystem: Bool,
     wavPath: String?,
     config: ResolvedConfig
-) async throws -> ([Float], String?) {
+) async throws -> RecordingResult {
     let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem)
 
     Log.status("Recording... Press Ctrl+C to stop.")
@@ -345,6 +380,9 @@ private func performRecording(
         }
     }
 
+    // Stamp the start here: naming the WAV by its end time hides the recorded span.
+    let startedAt = Date()
+
     // Start capture in background
     let captureTask = Task {
         try await capture.startCapture()
@@ -356,6 +394,7 @@ private func performRecording(
     // Stop capture and get samples
     Log.status("") // newline after ^C
     let samples = capture.stopCapture()
+    let endedAt = Date()
     sigintSource.cancel()
     signal(SIGINT, SIG_DFL)
 
@@ -367,18 +406,15 @@ private func performRecording(
     if let explicit = wavPath {
         resolvedWavPath = (explicit as NSString).expandingTildeInPath
     } else {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let timestamp = formatter.string(from: Date())
-        resolvedWavPath = (config.recordingsDir as NSString).appendingPathComponent("\(timestamp).wav")
+        resolvedWavPath = defaultWavPath(startedAt: startedAt, in: config.recordingsDir)
     }
 
     if !samples.isEmpty {
         try AudioWriter.writeWAV(samples: samples, to: resolvedWavPath)
-        return (samples, resolvedWavPath)
+        return RecordingResult(samples: samples, wavPath: resolvedWavPath, startedAt: startedAt, endedAt: endedAt)
     }
 
-    return ([], nil)
+    return RecordingResult(samples: [], wavPath: nil, startedAt: startedAt, endedAt: endedAt)
 }
 
 /// Transcribe audio samples using whisper.cpp.
