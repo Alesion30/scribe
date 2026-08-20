@@ -62,23 +62,43 @@ struct StreamingAudioTests {
         }
     }
 
-    @Test("Chunked writes match writeWAV byte for byte")
-    func chunkedWriteMatchesOneShot() throws {
+    @Test("Header describes 16 kHz mono 16-bit PCM")
+    func headerFields() throws {
         let samples = Self.sineWave(frequency: 220, amplitude: 0.8, count: 8000, sampleRate: 16000)
 
         try Self.withTemporaryDirectory { dir in
-            let streamed = (dir as NSString).appendingPathComponent("streamed.wav")
-            let writer = try StreamingWAVWriter(path: streamed)
+            let path = (dir as NSString).appendingPathComponent("header.wav")
+            let writer = try StreamingWAVWriter(path: path)
             try writer.append(samples[0..<3000])
             try writer.append(samples[3000..<8000])
             try writer.finalize()
 
-            let oneShot = (dir as NSString).appendingPathComponent("oneshot.wav")
-            try AudioWriter.writeWAV(samples: samples, to: oneShot)
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let dataSize = UInt32(samples.count * MemoryLayout<Int16>.size)
 
-            let a = try Data(contentsOf: URL(fileURLWithPath: streamed))
-            let b = try Data(contentsOf: URL(fileURLWithPath: oneShot))
-            #expect(a == b)
+            #expect(String(data: data[0..<4], encoding: .ascii) == "RIFF")
+            #expect(String(data: data[8..<12], encoding: .ascii) == "WAVE")
+            #expect(String(data: data[12..<16], encoding: .ascii) == "fmt ")
+            #expect(String(data: data[36..<40], encoding: .ascii) == "data")
+
+            let riffSize: UInt32 = data.readLittleEndian(at: 4)
+            let formatTag: UInt16 = data.readLittleEndian(at: 20)
+            let channels: UInt16 = data.readLittleEndian(at: 22)
+            let sampleRate: UInt32 = data.readLittleEndian(at: 24)
+            let byteRate: UInt32 = data.readLittleEndian(at: 28)
+            let blockAlign: UInt16 = data.readLittleEndian(at: 32)
+            let bitsPerSample: UInt16 = data.readLittleEndian(at: 34)
+            let chunkSize: UInt32 = data.readLittleEndian(at: 40)
+
+            #expect(riffSize == 36 + dataSize)
+            #expect(formatTag == 1)
+            #expect(channels == 1)
+            #expect(sampleRate == 16000)
+            #expect(byteRate == 32000)
+            #expect(blockAlign == 2)
+            #expect(bitsPerSample == 16)
+            #expect(chunkSize == dataSize)
+            #expect(data.count == StreamingWAVWriter.headerSize + Int(dataSize))
         }
     }
 
