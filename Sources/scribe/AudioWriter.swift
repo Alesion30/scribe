@@ -454,10 +454,12 @@ struct AudioWriter {
         var scale: Float = 32767.0
         vDSP_vsmul(clampedSamples, 1, &scale, &scaled, 1, vDSP_Length(samples.count))
 
-        for sample in scaled {
-            let int16Value = Int16(max(-32768, min(32767, Int32(sample))))
-            data.append(littleEndian: int16Value)
-        }
+        // The clip above already bounds the range, so vDSP_vfix16 can truncate without clamping
+        var pcm = [Int16](repeating: 0, count: samples.count)
+        vDSP_vfix16(scaled, 1, &pcm, 1, vDSP_Length(samples.count))
+
+        // macOS is little-endian, so the Int16 buffer is already in WAV byte order
+        pcm.withUnsafeBufferPointer { data.append($0) }
 
         let url = URL(fileURLWithPath: path)
         try data.write(to: url)
@@ -527,7 +529,7 @@ struct AudioWriter {
         return monoSamples
     }
 
-    private static func readRawWAV(from url: URL) throws -> [Float] {
+    static func readRawWAV(from url: URL) throws -> [Float] {
         let fileData = try Data(contentsOf: url)
         guard fileData.count >= 44 else {
             throw AudioWriterError.invalidWAVHeader("File too small for WAV header")
@@ -573,34 +575,42 @@ struct AudioWriter {
             throw AudioWriterError.invalidWAVHeader("No data chunk found")
         }
 
-        let bytesPerSample = Int(bitsPerSample) / 8
-        let sampleCount = Int(dataSize) / bytesPerSample
-
-        var floats: [Float]
-        if bitsPerSample == 16 {
-            let int16Count = sampleCount
-            floats = [Float](repeating: 0, count: int16Count)
-            for i in 0..<int16Count {
-                let offset = dataOffset + i * 2
-                guard offset + 1 < fileData.count else { break }
-                let value: Int16 = fileData.readLittleEndian(at: offset)
-                floats[i] = Float(value) / 32768.0
-            }
-        } else {
+        // Checked before bitsPerSample becomes a divisor, so a malformed zero depth cannot trap
+        guard bitsPerSample == 16 else {
             throw AudioWriterError.invalidWAVHeader("Unsupported bit depth: \(bitsPerSample)")
         }
 
+        let bytesPerSample = Int(bitsPerSample) / 8
+        let sampleCount = Int(dataSize) / bytesPerSample
+
+        // A truncated file can declare more samples than it stores; the missing tail stays silent
+        let readCount = min(sampleCount, (fileData.count - dataOffset) / bytesPerSample)
+        var pcm = [Int16](repeating: 0, count: sampleCount)
+        _ = pcm.withUnsafeMutableBytes {
+            fileData.copyBytes(to: $0, from: dataOffset..<(dataOffset + readCount * bytesPerSample))
+        }
+
+        var floats = [Float](repeating: 0, count: sampleCount)
+        vDSP_vflt16(pcm, 1, &floats, 1, vDSP_Length(sampleCount))
+        var divisor: Float = 32768.0
+        vDSP_vsdiv(floats, 1, &divisor, &floats, 1, vDSP_Length(sampleCount))
+
         // Mix to mono if multi-channel
-        if numChannels > 1 {
-            let frameCount = floats.count / Int(numChannels)
+        let channels = Int(numChannels)
+        if channels > 1 {
+            let frameCount = floats.count / channels
             var mono = [Float](repeating: 0, count: frameCount)
-            for frame in 0..<frameCount {
-                var sum: Float = 0
-                for ch in 0..<Int(numChannels) {
-                    sum += floats[frame * Int(numChannels) + ch]
+            floats.withUnsafeBufferPointer { src in
+                mono.withUnsafeMutableBufferPointer { dst in
+                    guard let input = src.baseAddress, let output = dst.baseAddress else { return }
+                    // Each channel is a strided view into the interleaved buffer
+                    for ch in 0..<channels {
+                        vDSP_vadd(output, 1, input + ch, vDSP_Stride(channels), output, 1, vDSP_Length(frameCount))
+                    }
                 }
-                mono[frame] = sum / Float(numChannels)
             }
+            var divisor = Float(channels)
+            vDSP_vsdiv(mono, 1, &divisor, &mono, 1, vDSP_Length(frameCount))
             floats = mono
         }
 
