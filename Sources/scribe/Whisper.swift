@@ -38,7 +38,16 @@ final class WhisperContext {
     }
 
     /// Transcribe Float PCM samples (16 kHz mono) and return text.
-    func transcribe(samples: [Float], language: String = "auto") throws -> String {
+    ///
+    /// `onSegment` fires as each segment is decoded, so callers can emit results
+    /// while a long file is still running instead of waiting for the whole thing.
+    @discardableResult
+    func transcribe(
+        samples: [Float],
+        language: String = "auto",
+        showProgress: Bool = false,
+        onSegment: ((String) -> Void)? = nil
+    ) throws -> String {
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
 
         let threadCount = Int32(max(1, min(8, ProcessInfo.processInfo.processorCount - 2)))
@@ -50,11 +59,23 @@ final class WhisperContext {
         params.translate = false
         params.no_context = true
 
-        if Log.verbose {
+        if showProgress {
             params.progress_callback = { (_: OpaquePointer?, _: OpaquePointer?, progress: Int32, _: UnsafeMutableRawPointer?) in
                 Log.progress("Transcribing... \(progress)%")
             }
         }
+
+        let collector = SegmentCollector(onSegment: onSegment)
+        params.new_segment_callback = { (ctx: OpaquePointer?, _: OpaquePointer?, newCount: Int32, userData: UnsafeMutableRawPointer?) in
+            guard let ctx, let userData else { return }
+            let collector = Unmanaged<SegmentCollector>.fromOpaque(userData).takeUnretainedValue()
+            let total = whisper_full_n_segments(ctx)
+            for i in max(0, total - newCount)..<total {
+                guard let cStr = whisper_full_get_segment_text(ctx, i) else { continue }
+                collector.append(String(cString: cStr))
+            }
+        }
+        params.new_segment_callback_user_data = Unmanaged.passUnretained(collector).toOpaque()
 
         let result: Int32 = try language.withCString { langPtr in
             params.language = langPtr
@@ -71,14 +92,28 @@ final class WhisperContext {
             throw WhisperError.transcriptionFailed
         }
 
-        let segmentCount = whisper_full_n_segments(context)
-        var text = ""
-        for i in 0..<segmentCount {
-            guard let cStr = whisper_full_get_segment_text(context, i) else { continue }
-            if !text.isEmpty { text += "\n" }
-            text += String(cString: cStr)
-        }
+        return collector.text
+    }
+}
 
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+/// Bridges whisper.cpp's C segment callback back into Swift.
+private final class SegmentCollector {
+    private let onSegment: ((String) -> Void)?
+    private var lines: [String] = []
+
+    init(onSegment: ((String) -> Void)?) {
+        self.onSegment = onSegment
+    }
+
+    var text: String {
+        lines.joined(separator: "\n")
+    }
+
+    /// whisper pads each segment with a leading space; trim per line since we emit them one by one.
+    func append(_ segment: String) {
+        let line = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty else { return }
+        lines.append(line)
+        onSegment?(line)
     }
 }

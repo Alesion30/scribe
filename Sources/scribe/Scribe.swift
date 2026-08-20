@@ -81,15 +81,16 @@ extension Scribe {
                 throw ScribeError.noAudioCaptured
             }
 
-            // Transcribe
-            let text = try await performTranscription(
+            // Transcribe, streaming segments to the output as they are decoded
+            let writer = try TranscriptWriter(path: output)
+            defer { writer.close() }
+
+            try await performTranscription(
                 samples: samples,
                 modelName: config.model,
-                language: config.language
+                language: config.language,
+                writer: writer
             )
-
-            // Output
-            try writeOutput(text, to: output)
 
             if let wav = wavFile {
                 Log.status("Recording saved to: \(wav)")
@@ -168,13 +169,15 @@ extension Scribe {
             let samples = try AudioWriter.readWAV(from: path)
             Log.info("Read \(samples.count) samples (\(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s)")
 
-            let text = try await performTranscription(
+            let writer = try TranscriptWriter(path: output)
+            defer { writer.close() }
+
+            try await performTranscription(
                 samples: samples,
                 modelName: config.model,
-                language: config.language
+                language: config.language,
+                writer: writer
             )
-
-            try writeOutput(text, to: output)
         }
     }
 }
@@ -381,36 +384,31 @@ private func performRecording(
     return ([], nil)
 }
 
-/// Transcribe audio samples using whisper.cpp.
+/// Transcribe audio samples using whisper.cpp, writing each segment to `writer` as it lands.
 /// Downloads the model first if it is a known model that hasn't been fetched yet.
 private func performTranscription(
     samples: [Float],
     modelName: String,
-    language: String
-) async throws -> String {
+    language: String,
+    writer: TranscriptWriter
+) async throws {
     let modelPath = try await ModelManager.ensureModel(modelName)
 
     Log.status("Loading model: \(modelName)")
     let whisper = try WhisperContext(modelPath: modelPath)
 
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
-    let text = try whisper.transcribe(samples: samples, language: language)
 
-    if Log.verbose {
-        FileHandle.standardError.write(Data("\n".utf8))
+    // The transcript itself is the progress indicator when it streams to stdout,
+    // and a percentage on stderr would only tangle with it there.
+    let showProgress = Log.verbose || !writer.isStdout
+
+    try whisper.transcribe(samples: samples, language: language, showProgress: showProgress) { segment in
+        writer.write(segment: segment)
     }
 
-    return text
-}
-
-/// Write text to file or stdout.
-private func writeOutput(_ text: String, to path: String) throws {
-    if path == "-" {
-        print(text)
-    } else {
-        let expandedPath = (path as NSString).expandingTildeInPath
-        try text.write(toFile: expandedPath, atomically: true, encoding: .utf8)
-        Log.status("Transcript written to: \(expandedPath)")
+    if showProgress {
+        FileHandle.standardError.write(Data("\n".utf8))
     }
 }
 
@@ -421,6 +419,7 @@ enum ScribeError: LocalizedError {
     case fileNotFound(String)
     case unknownModel(String)
     case invalidURL(String)
+    case cannotWriteOutput(String)
 
     var errorDescription: String? {
         switch self {
@@ -436,6 +435,8 @@ enum ScribeError: LocalizedError {
                 """
         case .invalidURL(let url):
             return "Invalid URL: \(url)"
+        case .cannotWriteOutput(let path):
+            return "Cannot write transcript to: \(path)"
         }
     }
 }
