@@ -6,6 +6,7 @@ A macOS command-line tool that captures audio from the microphone and/or system 
 
 - **Dual audio capture** — Record microphone and system audio simultaneously via ScreenCaptureKit (macOS 15+)
 - **Local transcription** — Runs whisper.cpp on-device with Metal GPU acceleration
+- **Streaming output** — Transcript segments are written out as they are decoded, so long files show progress and an interrupted run keeps what it got
 - **Flexible workflow** — Record and transcribe in one step, or use them separately
 - **Language detection** — Automatic language detection or manual hint (ISO 639-1)
 - **Model management** — Download, list, and remove whisper models from the CLI
@@ -102,6 +103,22 @@ scribe transcribe recording.wav
 # Specify model and language
 scribe transcribe recording.wav -m large-v3-turbo -l ja
 ```
+
+### Transcript Output
+
+Segments are appended to the destination as whisper decodes them, so a long recording is readable while it is still being processed:
+
+```bash
+scribe transcribe meeting.wav -o transcript.txt
+tail -f transcript.txt    # from another shell
+```
+
+Two things follow from writing incrementally:
+
+- If the run fails or you interrupt it, everything decoded up to that point stays in the file
+- The destination is truncated when the command starts, the same way shell redirection with `>` behaves
+
+When the transcript goes to a file, a progress percentage is printed to stderr. Writing to stdout (the default) skips it — the transcript itself shows the progress there.
 
 ### Manage Models
 
