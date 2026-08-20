@@ -1,143 +1,162 @@
 # scribe
 
-A macOS command-line tool that captures audio from the microphone and/or system audio, then transcribes it locally using [whisper.cpp](https://github.com/ggml-org/whisper.cpp). All processing happens on-device — no data leaves your machine.
+マイクとシステム音声を録音し、[whisper.cpp](https://github.com/ggml-org/whisper.cpp) でローカルに文字起こしする macOS 向けのコマンドラインツール。処理はすべて端末内で完結し、データが外部に送られることはない。
 
-## Features
+## 機能
 
-- **Dual audio capture** — Record microphone and system audio simultaneously via ScreenCaptureKit (macOS 15+)
-- **Local transcription** — Runs whisper.cpp on-device with Metal GPU acceleration
-- **Flexible workflow** — Record and transcribe in one step, or use them separately
-- **Language detection** — Automatic language detection or manual hint (ISO 639-1)
-- **Model management** — Download, list, and remove whisper models from the CLI
+- **マイクとシステム音声の同時録音** — ScreenCaptureKit（macOS 15 以降）で両方を同時に取り込む
+- **ローカル文字起こし** — whisper.cpp を Metal GPU アクセラレーション付きで端末内実行
+- **柔軟なワークフロー** — 録音と文字起こしを一度に実行することも、個別に実行することもできる
+- **言語判定** — 自動判定、または ISO 639-1 コードでの明示指定
+- **モデル管理** — whisper モデルのダウンロード・一覧・削除を CLI から実行
 
-## Requirements
+## 動作要件
 
-- macOS 15.0 (Sequoia) or later
-- Xcode 16+ / Swift 6.0+
-- Screen Recording permission (System Settings > Privacy & Security > Screen & System Audio Recording)
+- macOS 15.0 (Sequoia) 以降
+- Xcode 16 以降 / Swift 6.0 以降（ソースからビルドする場合）
+- 画面収録の権限（システム設定 > プライバシーとセキュリティ > 画面収録とシステムオーディオ録音）
 
-## Installation
+## インストール
 
-### Prebuilt Binary
+### mise で導入する（推奨）
 
-Download `scribe-macos-<arch>.tar.gz` from the [releases page](https://github.com/your-username/scribe/releases). The tarball is self-contained — it bundles `whisper.framework`, so extracting it is all you need:
+[mise](https://mise.jdx.dev/) が入っていれば、リリース版のバイナリを 1 コマンドで導入できる。mise 自体の導入方法は[公式のインストール手順](https://mise.jdx.dev/installing-mise.html)を参照。
+
+```bash
+mise use -g "github:Alesion30/scribe"
+scribe --help
+```
+
+更新は `mise upgrade` で行う。
+
+### ビルド済みバイナリを手動で展開する
+
+[リリースページ](https://github.com/Alesion30/scribe/releases)から `scribe-macos-<arch>.tar.gz` をダウンロードする。tarball は `whisper.framework` を同梱した自己完結型なので、展開するだけで使える。
 
 ```bash
 tar xzf scribe-macos-arm64.tar.gz
 ./scribe-macos-arm64/scribe --help
 ```
 
-The binary looks up `whisper.framework` relative to its own location (`@loader_path`), so keep them in the same directory when moving them.
+バイナリは自身の位置（`@loader_path`）を起点に `whisper.framework` を探すため、移動するときは同じディレクトリに置いたままにする。
 
-### Build from Source
+### ソースからビルドする
+
+ビルドに使う Swift ツールチェーンは `mise.toml` で固定してある。mise が未導入なら[公式のインストール手順](https://mise.jdx.dev/installing-mise.html)に従って入れる。
 
 ```bash
-git clone https://github.com/your-username/scribe.git
+git clone https://github.com/Alesion30/scribe.git
 cd scribe
-swift build -c release
+mise install       # mise.toml に固定した Swift ツールチェーンを導入
+mise run build     # swift build -c release
 ```
 
-The binary will be at `.build/release/scribe`. You can copy it to a directory in your `$PATH`:
+ビルドしたバイナリは `.build/release/scribe` に置かれる。動作確認と、`$PATH` の通ったディレクトリへの配置は次のとおり。
 
 ```bash
+.build/release/scribe --help
 cp .build/release/scribe /usr/local/bin/
 ```
 
-### Download a Model
+ScreenCaptureKit などの Apple フレームワークの SDK は Xcode に含まれるものを使うため、mise とは別に Xcode 16 以降が必要になる。
 
-scribe requires a whisper.cpp compatible model (GGML format). On first run, if the configured model is a standard one (see [Available Models](#available-models)) and hasn't been downloaded yet, scribe offers to download it automatically — no manual setup needed.
+利用できるタスクは `mise tasks` で一覧できる。
 
-To download a model ahead of time:
+### モデルのダウンロード
+
+scribe は whisper.cpp 互換のモデル（GGML 形式）を必要とする。設定されているモデルが標準モデル（[利用可能なモデル](#利用可能なモデル)を参照）で、まだダウンロードされていない場合、初回実行時に自動ダウンロードを提案するので、事前準備は必須ではない。
+
+先にダウンロードしておく場合は次のようにする。
 
 ```bash
-# Standard models need no URL (default: large-v3-turbo, ~1.5 GB)
+# 標準モデルは URL の指定が不要（既定: large-v3-turbo, 約 1.5 GB）
 scribe model download large-v3-turbo
 
-# Lightweight alternative (~141 MB, faster but less accurate)
+# 軽量な選択肢（約 141 MB、高速だが精度は落ちる）
 scribe model download base
 
-# Custom models can be fetched from any URL
+# 任意の URL から独自モデルを取得することもできる
 scribe model download my-model -u https://example.com/ggml-my-model.bin
 ```
 
-Models are saved to `~/.scribe/models/`.
+モデルは `~/.scribe/models/` に保存される。
 
-## Usage
+## 使い方
 
-### Record and Transcribe (Default)
+### 録音して文字起こしする（既定動作）
 
 ```bash
-# Record audio, then transcribe when you press Ctrl+C
+# 録音し、Ctrl+C を押した時点で文字起こしする
 scribe
 
-# Specify a model and language
-scribe -m base -l en
+# モデルと言語を指定する
+scribe -m base -l ja
 
-# Save the recording as a WAV file
+# 録音を WAV ファイルとして保存する
 scribe -w recording.wav
 
-# Write transcript to a file instead of stdout
+# 文字起こし結果を標準出力ではなくファイルに書き出す
 scribe -o transcript.txt
 ```
 
-### Record Only
+### 録音だけする
 
 ```bash
-# Record and save as WAV (no transcription)
+# 録音して WAV として保存する（文字起こしはしない）
 scribe record -o meeting.wav
 
-# System audio only (no microphone)
+# システム音声のみ（マイクを使わない）
 scribe record --no-mic
 
-# Microphone only (no system audio)
+# マイクのみ（システム音声を取り込まない）
 scribe record --no-system
 ```
 
-### Transcribe an Existing File
+### 既存のファイルを文字起こしする
 
 ```bash
-# Transcribe a WAV file
+# WAV ファイルを文字起こしする
 scribe transcribe recording.wav
 
-# Specify model and language
+# モデルと言語を指定する
 scribe transcribe recording.wav -m large-v3-turbo -l ja
 ```
 
-### Manage Models
+### モデルを管理する
 
 ```bash
-# List downloaded models
+# ダウンロード済みのモデルを一覧する
 scribe model list
 
-# Download a standard model by name
+# 標準モデルを名前だけでダウンロードする
 scribe model download <name>
 
-# Download a custom model from a URL
+# 任意の URL から独自モデルをダウンロードする
 scribe model download <name> -u <url>
 
-# Remove a model
+# モデルを削除する
 scribe model remove <name>
 ```
 
-### Verbose Output
+### 詳細ログを出す
 
-Add `-v` / `--verbose` to any command for detailed logging to stderr:
+どのコマンドにも `-v` / `--verbose` を付けると、標準エラー出力に詳細なログが出る。
 
 ```bash
 scribe -v -m base
 ```
 
-## Configuration
+## 設定
 
-scribe uses a layered configuration system. Priority (highest to lowest):
+scribe の設定は階層的に解決される。優先度は高い順に次のとおり。
 
-1. CLI flags
-2. Config file (`~/.scribe/config.json`)
-3. Built-in defaults
+1. CLI のフラグ
+2. 設定ファイル（`~/.scribe/config.json`）
+3. 組み込みの既定値
 
-### Config File
+### 設定ファイル
 
-Create `~/.scribe/config.json` to set persistent defaults:
+`~/.scribe/config.json` を作ると、既定値を永続化できる。
 
 ```json
 {
@@ -149,102 +168,101 @@ Create `~/.scribe/config.json` to set persistent defaults:
 }
 ```
 
-All fields are optional. A JSON Schema is available at [`schema/config.schema.json`](schema/config.schema.json).
+すべての項目は任意。JSON Schema を [`schema/config.schema.json`](schema/config.schema.json) に用意してある。
 
-### Environment Variables
+### 環境変数
 
-| Variable | Description |
+| 変数 | 説明 |
 |---|---|
-| `SCRIBE_HOME` | Override the base directory (default: `~/.scribe`) |
+| `SCRIBE_HOME` | ベースディレクトリを上書きする（既定: `~/.scribe`） |
 
-### Directory Structure
+### ディレクトリ構成
 
 ```
 ~/.scribe/
-├── config.json        # Configuration file (optional)
-├── models/            # Downloaded whisper models
+├── config.json        # 設定ファイル（任意）
+├── models/            # ダウンロードした whisper モデル
 │   └── base.bin
-└── recordings/        # Saved audio recordings
+└── recordings/        # 保存した録音データ
     └── 2025-01-15_14-30-00.wav
 ```
 
-## Permissions
+## 権限
 
-On first run, macOS will prompt for the following permissions:
+初回実行時に、macOS が次の権限を求める。
 
-| Permission | Required For | Where to Enable |
+| 権限 | 用途 | 設定場所 |
 |---|---|---|
-| Screen & System Audio Recording | Capturing system audio | System Settings > Privacy & Security > Screen & System Audio Recording |
-| Microphone | Capturing microphone input | System Settings > Privacy & Security > Microphone |
+| 画面収録とシステムオーディオ録音 | システム音声の取り込み | システム設定 > プライバシーとセキュリティ > 画面収録とシステムオーディオ録音 |
+| マイク | マイク入力の取り込み | システム設定 > プライバシーとセキュリティ > マイク |
 
-Grant access to your terminal application (Terminal, iTerm2, etc.).
+権限は、scribe を起動したターミナルアプリ（Terminal、iTerm2 など）に対して許可する。
 
-## Available Models
+## 利用可能なモデル
 
-| Model | Size | Description |
+| モデル | サイズ | 特徴 |
 |---|---|---|
-| `tiny` | ~74 MB | Fastest, least accurate |
-| `base` | ~141 MB | Good for quick tests |
-| `small` | ~465 MB | Balanced |
-| `medium` | ~1.4 GB | More accurate |
-| `large-v3-turbo` | ~1.5 GB | Best speed/accuracy tradeoff (default) |
-| `large-v3` | ~2.9 GB | Most accurate |
+| `tiny` | 約 74 MB | 最速だが精度は最も低い |
+| `base` | 約 141 MB | 動作確認向け |
+| `small` | 約 465 MB | 速度と精度のバランス型 |
+| `medium` | 約 1.4 GB | 精度重視 |
+| `large-v3-turbo` | 約 1.5 GB | 速度と精度のバランスが最も良い（既定） |
+| `large-v3` | 約 2.9 GB | 最も精度が高い |
 
-These standard models can be downloaded by name alone (`scribe model download <name>`); they are hosted on [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp/tree/main) as `ggml-*.bin` files.
+これらの標準モデルは名前だけでダウンロードできる（`scribe model download <name>`）。実体は [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp/tree/main) で `ggml-*.bin` として公開されているもの。
 
-## Development
+## 開発
 
-### Tests
+### テスト
 
-Unit and integration tests live under `Tests/scribeTests/`.
-
-```bash
-# Run the full test suite (unit + integration)
-swift test
-```
-
-The integration suite (`TranscriptionIntegrationTests`) feeds Japanese WAV fixtures through the real `WhisperContext` to catch regressions in the transcription pipeline. It is **automatically skipped** when the configured whisper model is not present locally, so a fresh checkout does not fail.
-
-Override the model used by integration tests:
+ユニットテストと結合テストは `Tests/scribeTests/` にある。
 
 ```bash
-SCRIBE_TEST_MODEL=base swift test
+mise run test    # swift test
 ```
 
-### Smoke Test
+結合テスト（`TranscriptionIntegrationTests`）は日本語の WAV フィクスチャを実際の `WhisperContext` に通し、文字起こしパイプラインのリグレッションを検出する。設定されている whisper モデルがローカルにない場合は自動的にスキップされるので、クローン直後でもテストは失敗しない。
 
-A one-shot script that builds the release binary and verifies a known fixture transcribes correctly:
+結合テストで使うモデルを変えるには次のようにする。
 
 ```bash
-./scripts/smoke.sh                                    # default: weather sample, looks for 「天気」
-./scripts/smoke.sh -f path/to.wav -k expected_word    # override fixture and keyword
-./scripts/smoke.sh -h                                 # help
+SCRIBE_TEST_MODEL=base mise run test
 ```
 
-### Regenerating Fixtures
+### スモークテスト
 
-Fixtures are committed under `Tests/scribeTests/Fixtures/`. To regenerate them with macOS `say` (Kyoko voice):
+リリースビルドを作り、既知のフィクスチャが期待どおり文字起こしされるかを確認する一発実行のスクリプト。
+
+```bash
+mise run smoke                                        # 既定: 天気サンプルで「天気」を探す
+./scripts/smoke.sh -f path/to.wav -k expected_word    # フィクスチャと期待キーワードを変更する
+./scripts/smoke.sh -h                                 # ヘルプ
+```
+
+### フィクスチャの再生成
+
+フィクスチャは `Tests/scribeTests/Fixtures/` にコミットしてある。macOS の `say`（Kyoko の音声）で再生成するには次を実行する。
 
 ```bash
 ./scripts/generate-fixtures.sh
 ```
 
-This writes 16 kHz mono 16-bit WAV files matching scribe's transcription pipeline format. Regeneration may produce slightly different byte sequences depending on macOS version.
+scribe の文字起こしパイプラインが扱う形式に合わせて、16 kHz モノラル 16 bit の WAV を書き出す。再生成した結果は macOS のバージョンによって多少バイト列が変わることがある。
 
-## Architecture
+## アーキテクチャ
 
-scribe is built with:
+scribe は次の技術で構成している。
 
-- **[ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit)** — macOS framework for audio/screen capture with `captureMicrophone` support (macOS 15+)
-- **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — C/C++ port of OpenAI's Whisper model, integrated via XCFramework with Metal GPU acceleration
-- **[Swift Argument Parser](https://github.com/apple/swift-argument-parser)** — Type-safe CLI argument parsing
-- **[Accelerate (vDSP)](https://developer.apple.com/documentation/accelerate/vdsp)** — Hardware-accelerated audio signal processing
+- **[ScreenCaptureKit](https://developer.apple.com/documentation/screencapturekit)** — `captureMicrophone` に対応した macOS の音声・画面キャプチャフレームワーク（macOS 15 以降）
+- **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — OpenAI Whisper の C/C++ 実装。XCFramework として組み込み、Metal GPU アクセラレーションを利用する
+- **[Swift Argument Parser](https://github.com/apple/swift-argument-parser)** — 型安全な CLI 引数のパース
+- **[Accelerate (vDSP)](https://developer.apple.com/documentation/accelerate/vdsp)** — ハードウェアアクセラレーションによる音声信号処理
 
-## License
+## ライセンス
 
 MIT
 
-## Acknowledgments
+## 謝辞
 
-- [OpenAI Whisper](https://github.com/openai/whisper) — Original speech recognition model
-- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) — High-performance C/C++ inference engine
+- [OpenAI Whisper](https://github.com/openai/whisper) — 原典となる音声認識モデル
+- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) — 高性能な C/C++ 推論エンジン
