@@ -411,6 +411,27 @@ struct AudioWriter {
         return result
     }
 
+    // MARK: - Slicing
+
+    /// Extract a time range from 16kHz mono samples.
+    /// A range running past the end is clamped to the last sample, mirroring `ffmpeg -t`.
+    static func slice(_ samples: [Float], startSeconds: Double, durationSeconds: Double? = nil) -> [Float] {
+        guard !samples.isEmpty else { return [] }
+
+        // Clamp in seconds first: converting an out-of-range Double to Int traps.
+        let totalSamples = Double(samples.count)
+        let start = Int(min(max(0, startSeconds * sampleRate), totalSamples))
+
+        let end: Int
+        if let durationSeconds {
+            end = Int(min(Double(start) + max(0, durationSeconds) * sampleRate, totalSamples))
+        } else {
+            end = samples.count
+        }
+
+        return Array(samples[start..<end])
+    }
+
     // MARK: - WAV File I/O
 
     /// Write Float samples as 16kHz/mono/16-bit WAV file.
