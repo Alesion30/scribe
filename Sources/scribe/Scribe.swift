@@ -328,8 +328,12 @@ private func performRecording(
     wavPath: String?,
     config: ResolvedConfig
 ) async throws -> ([Float], String?) {
-    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem)
+    let paths = RecordingPaths(output: resolveWavPath(wavPath, config: config))
+    try paths.prepareDirectory()
 
+    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem, paths: paths)
+
+    Log.status("Recording to: \(paths.output)")
     Log.status("Recording... Press Ctrl+C to stop.")
 
     // Set up SIGINT handler for graceful stop
@@ -353,32 +357,37 @@ private func performRecording(
     // Wait for SIGINT
     await stopTask.value
 
-    // Stop capture and get samples
+    // Stop capture and close the per-source recordings
     Log.status("") // newline after ^C
-    let samples = capture.stopCapture()
+    let result = capture.stopCapture()
     sigintSource.cancel()
     signal(SIGINT, SIG_DFL)
 
     // Cancel capture task
     captureTask.cancel()
 
-    // Save WAV
-    let resolvedWavPath: String
-    if let explicit = wavPath {
-        resolvedWavPath = (explicit as NSString).expandingTildeInPath
-    } else {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let timestamp = formatter.string(from: Date())
-        resolvedWavPath = (config.recordingsDir as NSString).appendingPathComponent("\(timestamp).wav")
+    do {
+        let samples = try RecordingFinalizer.finalize(result, to: paths.output)
+        return samples.isEmpty ? ([], nil) : (samples, paths.output)
+    } catch {
+        Log.error("Failed to write \(paths.output): \(error.localizedDescription)")
+        for source in result.sources {
+            Log.status("  Source recording kept: \(source.path)")
+        }
+        throw error
+    }
+}
+
+/// Resolve the recording destination before capture starts, so the source files
+/// have somewhere to go and the user is told where the audio is going.
+private func resolveWavPath(_ explicit: String?, config: ResolvedConfig) -> String {
+    if let explicit {
+        return (explicit as NSString).expandingTildeInPath
     }
 
-    if !samples.isEmpty {
-        try AudioWriter.writeWAV(samples: samples, to: resolvedWavPath)
-        return (samples, resolvedWavPath)
-    }
-
-    return ([], nil)
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+    return (config.recordingsDir as NSString).appendingPathComponent("\(formatter.string(from: Date())).wav")
 }
 
 /// Transcribe audio samples using whisper.cpp.

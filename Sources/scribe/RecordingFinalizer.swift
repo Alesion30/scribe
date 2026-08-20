@@ -1,0 +1,224 @@
+import Foundation
+import Accelerate
+
+// MARK: - Recording Layout
+
+/// File layout of one recording session.
+///
+/// Each source is written to its own file while recording, because the mix
+/// gains can only be chosen once both sources are complete. The source files
+/// are removed as soon as `output` has been written.
+struct RecordingPaths {
+    let output: String
+
+    var mic: String { sourcePath(suffix: "mic") }
+    var system: String { sourcePath(suffix: "system") }
+
+    /// Create the directory holding the recording, so capture fails before recording rather than after.
+    func prepareDirectory() throws {
+        let directory = (output as NSString).deletingLastPathComponent
+        guard !directory.isEmpty else { return }
+        try FileManager.default.createDirectory(atPath: directory, withIntermediateDirectories: true)
+    }
+
+    private func sourcePath(suffix: String) -> String {
+        "\((output as NSString).deletingPathExtension).\(suffix).wav"
+    }
+}
+
+/// A capture source on disk, with the levels needed to decide how to mix it.
+struct CapturedSource {
+    let path: String
+    let sampleCount: Int
+    let peak: Float
+    let rms: Float
+}
+
+struct CaptureResult {
+    let mic: CapturedSource?
+    let system: CapturedSource?
+
+    var sources: [CapturedSource] { [mic, system].compactMap(\.self) }
+}
+
+// MARK: - Finalizer
+
+/// Turns the per-source recordings into the final mixed WAV.
+enum RecordingFinalizer {
+    /// Sources quieter than this are left out of the mix entirely.
+    /// Prevents amplifying system noise during offline meetings
+    /// (where no meaningful system audio exists) and vice versa.
+    static let silenceRMSThreshold: Float = 0.01
+
+    /// Level each source is brought to before mixing, so a quiet mic doesn't get buried.
+    static let mixTargetPeak: Float = 0.5
+
+    /// Samples mixed per iteration. Bounds the working set, not the result.
+    static let chunkSize = 1 << 16
+
+    /// Mix, denoise and normalize the captured sources into `outputPath`.
+    ///
+    /// Returns the processed samples, or an empty array when there is nothing
+    /// worth transcribing. Source files are kept when the result is empty so a
+    /// misjudged silence threshold can't destroy a recording.
+    static func finalize(_ result: CaptureResult, to outputPath: String) throws -> [Float] {
+        guard !result.sources.isEmpty else {
+            Log.warning("No audio samples captured")
+            return []
+        }
+
+        let mic = includeIfAudible(result.mic, label: "Mic")
+        let system = includeIfAudible(result.system, label: "System")
+        let active = [mic, system].compactMap(\.self)
+
+        guard !active.isEmpty else {
+            Log.warning("Every source was near-silent; keeping the source recordings:")
+            for source in result.sources {
+                Log.status("  \(source.path)")
+            }
+            return []
+        }
+
+        var mixed = try mix(active, clipping: active.count > 1)
+        Log.debug("Mixed audio: \(mixed.count) samples")
+
+        // Reduce background noise before amplification
+        AudioWriter.reduceNoise(inPlace: &mixed)
+
+        // Normalize volume (peak → 0.9 to leave headroom)
+        AudioWriter.normalize(inPlace: &mixed, targetPeak: 0.9)
+
+        let duration = Double(mixed.count) / AudioWriter.sampleRate
+        Log.info("Final audio: \(mixed.count) samples (\(String(format: "%.1f", duration))s)")
+
+        try AudioWriter.writeWAV(samples: mixed, to: outputPath)
+
+        for source in result.sources {
+            try? FileManager.default.removeItem(atPath: source.path)
+        }
+
+        return mixed
+    }
+
+    // MARK: - Private
+
+    private static func includeIfAudible(_ source: CapturedSource?, label: String) -> CapturedSource? {
+        guard let source else { return nil }
+
+        guard source.rms >= silenceRMSThreshold else {
+            Log.info("\(label) audio is near-silent (RMS=\(String(format: "%.5f", source.rms))), excluding from mix")
+            return nil
+        }
+
+        Log.debug("\(label) audio RMS: \(String(format: "%.5f", source.rms))")
+        return source
+    }
+
+    /// Gain that brings a source to the mix target, matching AudioWriter.normalize.
+    private static func mixGain(for source: CapturedSource) -> Float {
+        guard source.peak > 0 else { return 1.0 }
+
+        let gain = mixTargetPeak / source.peak
+        return abs(gain - 1.0) < 0.05 ? 1.0 : gain
+    }
+
+    /// Sum the sources chunk by chunk, padding the shorter one with silence.
+    private static func mix(_ sources: [CapturedSource], clipping: Bool) throws -> [Float] {
+        let length = sources.map(\.sampleCount).max() ?? 0
+        let readers = try sources.map { try SourceFileReader($0) }
+        defer { readers.forEach { $0.close() } }
+
+        let gains = sources.map(mixGain(for:))
+
+        var mixed = [Float]()
+        mixed.reserveCapacity(length)
+
+        var written = 0
+        while written < length {
+            let count = min(chunkSize, length - written)
+            var accumulator = [Float](repeating: 0, count: count)
+
+            for (reader, gain) in zip(readers, gains) {
+                var samples = try reader.read(count)
+                guard !samples.isEmpty else { continue }
+                if gain != 1.0 {
+                    AudioWriter.applyGain(gain, to: &samples)
+                }
+                add(samples, into: &accumulator)
+            }
+
+            if clipping {
+                clamp(&accumulator)
+            }
+
+            mixed.append(contentsOf: accumulator)
+            written += count
+        }
+
+        return mixed
+    }
+
+    private static func add(_ samples: [Float], into accumulator: inout [Float]) {
+        let count = min(samples.count, accumulator.count)
+        guard count > 0 else { return }
+
+        accumulator.withUnsafeMutableBufferPointer { destination in
+            samples.withUnsafeBufferPointer { source in
+                guard let destinationBase = destination.baseAddress, let sourceBase = source.baseAddress else { return }
+                vDSP_vadd(destinationBase, 1, sourceBase, 1, destinationBase, 1, vDSP_Length(count))
+            }
+        }
+    }
+
+    private static func clamp(_ samples: inout [Float]) {
+        var lowerBound: Float = -1.0
+        var upperBound: Float = 1.0
+
+        samples.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            vDSP_vclip(base, 1, &lowerBound, &upperBound, base, 1, vDSP_Length(buffer.count))
+        }
+    }
+}
+
+// MARK: - Source File Reader
+
+/// Sequential reader for the 16 kHz mono files StreamingWAVWriter produces.
+private final class SourceFileReader {
+    private let handle: FileHandle
+    private var remaining: Int
+
+    init(_ source: CapturedSource) throws {
+        handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: source.path))
+        remaining = source.sampleCount
+        try handle.seek(toOffset: UInt64(StreamingWAVWriter.headerSize))
+    }
+
+    /// Read up to `count` samples. Returns fewer (or none) once the file runs out.
+    func read(_ count: Int) throws -> [Float] {
+        let wanted = min(count, remaining)
+        guard wanted > 0 else { return [] }
+
+        guard let data = try handle.read(upToCount: wanted * MemoryLayout<Int16>.size), !data.isEmpty else {
+            remaining = 0
+            return []
+        }
+
+        let sampleCount = data.count / MemoryLayout<Int16>.size
+        remaining -= sampleCount
+
+        var samples = [Float](repeating: 0, count: sampleCount)
+        data.withUnsafeBytes { raw in
+            for i in 0..<sampleCount {
+                let value = raw.loadUnaligned(fromByteOffset: i * MemoryLayout<Int16>.size, as: Int16.self)
+                samples[i] = Float(Int16(littleEndian: value)) / 32768.0
+            }
+        }
+
+        return samples
+    }
+
+    func close() {
+        try? handle.close()
+    }
+}
