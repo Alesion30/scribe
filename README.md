@@ -168,6 +168,24 @@ All fields are optional. A JSON Schema is available at [`schema/config.schema.js
     └── 2025-01-15_14-30-00.wav
 ```
 
+Recording files are named after the time the recording started.
+
+### Crash Recovery
+
+Audio is written to disk while recording, one file per source:
+
+```
+recordings/
+├── 2025-01-15_14-30-00.mic.wav
+└── 2025-01-15_14-30-00.system.wav
+```
+
+When you stop recording, these are mixed into `2025-01-15_14-30-00.wav` and deleted. If scribe is killed or the machine loses power, they stay behind as playable WAVs covering everything captured up to the last second, and can be transcribed directly:
+
+```bash
+scribe transcribe ~/.scribe/recordings/2025-01-15_14-30-00.mic.wav
+```
+
 ## Permissions
 
 On first run, macOS will prompt for the following permissions:
