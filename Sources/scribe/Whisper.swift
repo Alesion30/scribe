@@ -37,8 +37,8 @@ final class WhisperContext {
         Log.debug("Whisper context freed")
     }
 
-    /// Transcribe Float PCM samples (16 kHz mono) and return text.
-    func transcribe(samples: [Float], language: String = "auto") throws -> String {
+    /// Transcribe Float PCM samples (16 kHz mono) and return the segments with their timestamps.
+    func transcribe(samples: [Float], language: String = "auto") throws -> [TranscriptSegment] {
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
 
         let threadCount = Int32(max(1, min(8, ProcessInfo.processInfo.processorCount - 2)))
@@ -72,13 +72,30 @@ final class WhisperContext {
         }
 
         let segmentCount = whisper_full_n_segments(context)
-        var text = ""
+        var segments: [TranscriptSegment] = []
+        segments.reserveCapacity(Int(segmentCount))
+
         for i in 0..<segmentCount {
             guard let cStr = whisper_full_get_segment_text(context, i) else { continue }
-            if !text.isEmpty { text += "\n" }
-            text += String(cString: cStr)
+
+            // whisper prefixes segment text with a space; strip it so every output format starts clean.
+            let text = String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+
+            segments.append(
+                TranscriptSegment(
+                    start: Self.seconds(from: whisper_full_get_segment_t0(context, i)),
+                    end: Self.seconds(from: whisper_full_get_segment_t1(context, i)),
+                    text: text
+                )
+            )
         }
 
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return segments
+    }
+
+    /// whisper reports segment boundaries in centiseconds.
+    private static func seconds(from timestamp: Int64) -> TimeInterval {
+        TimeInterval(timestamp) / 100.0
     }
 }
