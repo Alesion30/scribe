@@ -619,7 +619,7 @@ struct AudioWriter {
 // MARK: - Audio Converter Helper
 
 /// Thread-safe state wrapper for AVAudioConverterInputBlock.
-private final class InputBlockState: @unchecked Sendable {
+final class InputBlockState: @unchecked Sendable {
     let buffer: AVAudioPCMBuffer
     var consumed = false
     init(buffer: AVAudioPCMBuffer) { self.buffer = buffer }
@@ -632,6 +632,7 @@ enum AudioWriterError: LocalizedError {
     case noChannelData
     case resamplingFailed
     case invalidWAVHeader(String)
+    case fileCreationFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -643,13 +644,15 @@ enum AudioWriterError: LocalizedError {
             return "Audio resampling failed"
         case .invalidWAVHeader(let detail):
             return "Invalid WAV header: \(detail)"
+        case .fileCreationFailed(let path):
+            return "Failed to create file: \(path)"
         }
     }
 }
 
 // MARK: - Data Helpers
 
-private extension Data {
+extension Data {
     mutating func append<T: FixedWidthInteger>(littleEndian value: T) {
         var le = value.littleEndian
         withUnsafePointer(to: &le) { ptr in
