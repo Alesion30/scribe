@@ -25,6 +25,12 @@
       "examples": ["ja", "en", "zh"],
       "default": "auto"
     },
+    "format": {
+      "type": "string",
+      "description": "Transcript output format. 'srt' and 'vtt' include segment timestamps.",
+      "enum": ["txt", "srt", "vtt"],
+      "default": "txt"
+    },
     "noMic": {
       "type": "boolean",
       "description": "Disable microphone input and capture system audio only.",
