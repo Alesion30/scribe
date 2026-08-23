@@ -49,12 +49,18 @@ struct RecordingFinalizerTests {
     }
 
     /// Write a source recording the way SourceRecorder does, stats included.
-    static func writeSource(_ samples: [Float], to path: String) throws -> CapturedSource {
+    static func writeSource(_ samples: [Float], to path: String, startSeconds: Double? = nil) throws -> CapturedSource {
         let writer = try StreamingWAVWriter(path: path)
         try writer.append(samples)
         try writer.finalize()
 
-        return CapturedSource(path: path, sampleCount: samples.count, peak: peak(samples), rms: rms(samples))
+        return CapturedSource(
+            path: path,
+            sampleCount: samples.count,
+            peak: peak(samples),
+            rms: rms(samples),
+            startSeconds: startSeconds
+        )
     }
 
     /// The pipeline stopCapture() ran before the sources were streamed to disk.
@@ -171,6 +177,58 @@ struct RecordingFinalizerTests {
         }
     }
 
+    // MARK: - Stream alignment
+
+    @Test("A source that started later is held back by the difference")
+    func laterSourceIsDelayed() throws {
+        let mic = Self.tone(frequency: 440, amplitude: 0.5, count: 32000)
+        let system = Self.tone(frequency: 220, amplitude: 0.5, count: 32000)
+
+        try Self.withTemporaryDirectory { dir in
+            let paths = RecordingPaths(output: (dir as NSString).appendingPathComponent("out.wav"))
+            let result = CaptureResult(
+                mic: try Self.writeSource(mic, to: paths.mic, startSeconds: 100.0),
+                system: try Self.writeSource(system, to: paths.system, startSeconds: 100.5)
+            )
+
+            let mixed = try RecordingFinalizer.finalize(result, to: paths.output)
+
+            // 2 s of mic plus the half second the system stream came up late.
+            #expect(mixed.count == 40000, "expected 40000 samples, got \(mixed.count)")
+            // The system tone only starts once its lead-in has played out.
+            #expect(Self.rms(Array(mixed[0..<8000])) < Self.rms(Array(mixed[8000..<32000])))
+        }
+    }
+
+    @Test("Sources are left where they are when one carries no timestamps")
+    func unstampedSourceIsNotDelayed() throws {
+        let mic = Self.tone(frequency: 440, amplitude: 0.5, count: 32000)
+        let system = Self.tone(frequency: 220, amplitude: 0.5, count: 32000)
+
+        try Self.withTemporaryDirectory { dir in
+            let paths = RecordingPaths(output: (dir as NSString).appendingPathComponent("out.wav"))
+            let result = CaptureResult(
+                mic: try Self.writeSource(mic, to: paths.mic, startSeconds: 100.0),
+                system: try Self.writeSource(system, to: paths.system, startSeconds: nil)
+            )
+
+            let mixed = try RecordingFinalizer.finalize(result, to: paths.output)
+
+            #expect(mixed.count == 32000, "expected 32000 samples, got \(mixed.count)")
+        }
+    }
+
+    @Test("Lead-in silence is measured from the earliest source")
+    func leadSamplesMeasuredFromEarliest() {
+        let sources = [
+            CapturedSource(path: "a", sampleCount: 16000, peak: 1, rms: 1, startSeconds: 100.5),
+            CapturedSource(path: "b", sampleCount: 16000, peak: 1, rms: 1, startSeconds: 100.0),
+            CapturedSource(path: "c", sampleCount: 16000, peak: 1, rms: 1, startSeconds: 101.0)
+        ]
+
+        #expect(RecordingFinalizer.leadSamples(for: sources) == [8000, 0, 16000])
+    }
+
     // MARK: - File handling
 
     @Test("Source files are removed once the output is written")
@@ -271,6 +329,27 @@ struct RecordingFinalizerTests {
             #expect(mixed.count == source.sampleCount)
             #expect(!FileManager.default.fileExists(atPath: paths.mic))
             #expect(FileManager.default.fileExists(atPath: paths.output))
+        }
+    }
+
+    @Test("A dropped buffer is restored as silence")
+    func recorderFillsDroppedBuffers() throws {
+        // 0.1 s chunks of 16 kHz mono, with the one covering 0.2-0.3 s never delivered.
+        let chunk = Self.tone(frequency: 440, amplitude: 0.5, count: 1600)
+
+        try Self.withTemporaryDirectory { dir in
+            let paths = RecordingPaths(output: (dir as NSString).appendingPathComponent("out.wav"))
+            let recorder = try SourceRecorder(label: "Mic", path: paths.mic, sampleRate: 16000, channels: 1)
+
+            recorder.append(chunk, startingAt: 100.0)
+            recorder.append(chunk, startingAt: 100.1)
+            recorder.append(chunk, startingAt: 100.3)
+
+            let source = try #require(recorder.finish())
+
+            // The three delivered chunks, plus the hole the missing one left.
+            #expect(source.sampleCount == 6400, "expected 6400 samples, got \(source.sampleCount)")
+            #expect(source.startSeconds == 100.0)
         }
     }
 

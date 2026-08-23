@@ -32,8 +32,8 @@ struct CapturedSource {
     let sampleCount: Int
     let peak: Float
     let rms: Float
-    /// Host-clock timestamp of the first source buffer, used to preserve capture skew in the mix.
-    let startSeconds: Double = 0
+    /// Host-clock instant of the first sample, or nil when no buffer carried a timestamp.
+    let startSeconds: Double?
 }
 
 struct CaptureResult {
@@ -81,6 +81,10 @@ enum RecordingFinalizer {
             return []
         }
 
+        if let micStart = mic?.startSeconds, let systemStart = system?.startSeconds {
+            Log.debug("System audio starts \(String(format: "%+.3f", systemStart - micStart))s relative to the mic")
+        }
+
         var mixed = try mix(active, clipping: active.count > 1)
         Log.debug("Mixed audio: \(mixed.count) samples")
 
@@ -124,10 +128,24 @@ enum RecordingFinalizer {
         return abs(gain - 1.0) < 0.05 ? 1.0 : gain
     }
 
-    /// Sum sources chunk by chunk, preserving their first-buffer host-clock offsets.
+    /// Silence each source needs at the front so they line up on the host clock.
+    ///
+    /// The two capture APIs never start together — ScreenCaptureKit needs an await round trip the
+    /// microphone does not — so mixing them head to head lays one source's audio over what the other
+    /// heard moments earlier, and whisper transcribes the same speech twice. Sources stay where they
+    /// are unless every one of them is stamped: an unstamped source has nothing to line up against.
+    static func leadSamples(for sources: [CapturedSource]) -> [Int] {
+        let stamps = sources.compactMap(\.startSeconds)
+        guard stamps.count == sources.count, let origin = stamps.min() else {
+            return Array(repeating: 0, count: sources.count)
+        }
+
+        return stamps.map { max(0, Int((($0 - origin) * AudioWriter.sampleRate).rounded())) }
+    }
+
+    /// Sum sources chunk by chunk, each one held at the offset the host clock gives it.
     private static func mix(_ sources: [CapturedSource], clipping: Bool) throws -> [Float] {
-        let earliest = sources.map(\.startSeconds).min() ?? 0
-        let offsets = sources.map { max(0, Int((($0.startSeconds - earliest) * AudioWriter.sampleRate).rounded())) }
+        let offsets = leadSamples(for: sources)
         let length = zip(sources, offsets).map { $0.sampleCount + $1 }.max() ?? 0
         let readers = try sources.map { try SourceFileReader($0) }
         defer { readers.forEach { $0.close() } }
