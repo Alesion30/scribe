@@ -9,26 +9,6 @@ struct TranscriptSegment: Equatable {
     let text: String
 }
 
-extension TranscriptSegment {
-    /// Drop segments that repeat the line right before them.
-    ///
-    /// whisper loops on audio it cannot resolve; the first occurrence still marks the stretch.
-    static func collapsingRepeats(_ segments: [TranscriptSegment]) -> [TranscriptSegment] {
-        var kept: [TranscriptSegment] = []
-        kept.reserveCapacity(segments.count)
-
-        for segment in segments where segment.text != kept.last?.text {
-            kept.append(segment)
-        }
-
-        let dropped = segments.count - kept.count
-        if dropped > 0 {
-            Log.debug("Collapsed \(dropped) repeated segments")
-        }
-        return kept
-    }
-}
-
 /// Output format for a transcript.
 enum TranscriptFormat: String, CaseIterable, Codable, ExpressibleByArgument {
     /// One line per segment, no timestamps.
@@ -70,7 +50,7 @@ extension TranscriptFormat {
     }
 
     /// Format seconds as `HH:MM:SS<sep>mmm`. Hours are not wrapped, so recordings past 100 hours widen the field.
-    private static func timecode(_ seconds: TimeInterval, millisecondSeparator: String) -> String {
+    static func timecode(_ seconds: TimeInterval, millisecondSeparator: String) -> String {
         let totalMilliseconds = Int((max(0, seconds) * 1000).rounded())
         let milliseconds = totalMilliseconds % 1000
         let totalSeconds = totalMilliseconds / 1000

@@ -58,46 +58,47 @@ final class WhisperContext {
         Log.debug("Whisper context freed")
     }
 
-    /// Transcribe Float PCM samples (16 kHz mono) and return the segments with their timestamps.
-    func transcribe(samples: [Float], options: TranscribeOptions = TranscribeOptions()) throws -> [TranscriptSegment] {
+    /// Transcribe Float PCM samples (16 kHz mono), emitting each timestamped segment as it is decoded.
+    func transcribe(
+        samples: [Float],
+        options: TranscribeOptions = TranscribeOptions(),
+        showProgress: Bool = false,
+        onSegment: @escaping (TranscriptSegment) -> Void
+    ) throws -> [TranscriptSegment] {
         let chunks = Self.chunks(sampleCount: samples.count, options: options)
         if chunks.count > 1 {
             Log.info("Split into \(chunks.count) chunks of \(String(format: "%.0f", options.chunkLength))s")
         }
 
-        var segments: [TranscriptSegment] = []
+        let collector = SegmentCollector(onSegment: onSegment)
         for (index, chunk) in chunks.enumerated() {
-            let decoded = try decode(
+            collector.startChunk(
+                offset: TimeInterval(chunk.fed.lowerBound) / AudioWriter.sampleRate,
+                ownedStart: TimeInterval(chunk.owned.lowerBound) / AudioWriter.sampleRate
+            )
+            try decode(
                 samples: samples,
                 range: chunk.fed,
                 options: options,
-                progress: ProgressReporter(chunkIndex: index, chunkCount: chunks.count)
+                collector: collector,
+                progress: showProgress ? ProgressReporter(chunkIndex: index, chunkCount: chunks.count) : nil
             )
-
-            let offset = TimeInterval(chunk.fed.lowerBound) / AudioWriter.sampleRate
-            let ownedStart = TimeInterval(chunk.owned.lowerBound) / AudioWriter.sampleRate
-
-            for segment in decoded {
-                let start = segment.start + offset
-                let end = segment.end + offset
-
-                // Assign by midpoint so the lead-in never emits the same line twice
-                guard (start + end) / 2 >= ownedStart else { continue }
-
-                segments.append(TranscriptSegment(start: start, end: end, text: segment.text))
-            }
         }
 
-        return TranscriptSegment.collapsingRepeats(segments)
+        if collector.droppedRepeats > 0 {
+            Log.debug("Collapsed \(collector.droppedRepeats) repeated segments")
+        }
+        return collector.segments
     }
 
-    /// Run `whisper_full` over one range of samples. Timestamps are relative to `range.lowerBound`.
+    /// Run `whisper_full` over one range of samples, feeding every decoded segment to `collector`.
     private func decode(
         samples: [Float],
         range: Range<Int>,
         options: TranscribeOptions,
-        progress: ProgressReporter
-    ) throws -> [TranscriptSegment] {
+        collector: SegmentCollector,
+        progress: ProgressReporter?
+    ) throws {
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
 
         let threadCount = Int32(max(1, min(8, ProcessInfo.processInfo.processorCount - 2)))
@@ -112,13 +113,30 @@ final class WhisperContext {
         // A loop latches onto non-speech tokens; whisper.cpp leaves them unsuppressed by default
         params.suppress_nst = true
 
-        if Log.verbose {
-            params.progress_callback = { (_, _, percent: Int32, userData: UnsafeMutableRawPointer?) in
+        if progress != nil {
+            params.progress_callback = { (_: OpaquePointer?, _: OpaquePointer?, percent: Int32, userData: UnsafeMutableRawPointer?) in
                 guard let userData else { return }
                 Unmanaged<ProgressReporter>.fromOpaque(userData).takeUnretainedValue().report(percent)
             }
-            params.progress_callback_user_data = Unmanaged.passUnretained(progress).toOpaque()
+            params.progress_callback_user_data = progress.map { Unmanaged.passUnretained($0).toOpaque() }
         }
+
+        params.new_segment_callback = { (ctx: OpaquePointer?, _: OpaquePointer?, newCount: Int32, userData: UnsafeMutableRawPointer?) in
+            guard let ctx, let userData else { return }
+            let collector = Unmanaged<SegmentCollector>.fromOpaque(userData).takeUnretainedValue()
+            let total = whisper_full_n_segments(ctx)
+            for i in max(0, total - newCount)..<total {
+                guard let cStr = whisper_full_get_segment_text(ctx, i) else { continue }
+                collector.append(
+                    TranscriptSegment(
+                        start: WhisperContext.seconds(from: whisper_full_get_segment_t0(ctx, i)),
+                        end: WhisperContext.seconds(from: whisper_full_get_segment_t1(ctx, i)),
+                        text: String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+                )
+            }
+        }
+        params.new_segment_callback_user_data = Unmanaged.passUnretained(collector).toOpaque()
 
         let result: Int32 = try withExtendedLifetime(progress) {
             // whisper.cpp maps timestamps back to the original audio after dropping silence
@@ -145,28 +163,6 @@ final class WhisperContext {
         if result != 0 {
             throw WhisperError.transcriptionFailed
         }
-
-        let segmentCount = whisper_full_n_segments(context)
-        var segments: [TranscriptSegment] = []
-        segments.reserveCapacity(Int(segmentCount))
-
-        for i in 0..<segmentCount {
-            guard let cStr = whisper_full_get_segment_text(context, i) else { continue }
-
-            // whisper prefixes segment text with a space; strip it so every output format starts clean.
-            let text = String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { continue }
-
-            segments.append(
-                TranscriptSegment(
-                    start: Self.seconds(from: whisper_full_get_segment_t0(context, i)),
-                    end: Self.seconds(from: whisper_full_get_segment_t1(context, i)),
-                    text: text
-                )
-            )
-        }
-
-        return segments
     }
 
     // MARK: - Chunking
@@ -206,6 +202,52 @@ final class WhisperContext {
     /// whisper reports segment boundaries in centiseconds.
     private static func seconds(from timestamp: Int64) -> TimeInterval {
         TimeInterval(timestamp) / 100.0
+    }
+}
+
+// MARK: - Segment Collection
+
+/// Bridges whisper.cpp's C segment callback back into Swift, placing each segment in the whole recording.
+final class SegmentCollector {
+    private let onSegment: (TranscriptSegment) -> Void
+    private(set) var segments: [TranscriptSegment] = []
+
+    /// Segments dropped for repeating the line before them.
+    private(set) var droppedRepeats = 0
+
+    private var lastText: String?
+    private var offset: TimeInterval = 0
+    private var ownedStart: TimeInterval = 0
+
+    init(onSegment: @escaping (TranscriptSegment) -> Void) {
+        self.onSegment = onSegment
+    }
+
+    /// whisper restarts timestamps at zero per chunk, so each chunk declares where it sits.
+    func startChunk(offset: TimeInterval, ownedStart: TimeInterval) {
+        self.offset = offset
+        self.ownedStart = ownedStart
+    }
+
+    func append(_ segment: TranscriptSegment) {
+        guard !segment.text.isEmpty else { return }
+
+        let start = segment.start + offset
+        let end = segment.end + offset
+
+        // Assign by midpoint so the lead-in never emits the same line twice
+        guard (start + end) / 2 >= ownedStart else { return }
+
+        // whisper loops on audio it cannot resolve; the first occurrence still marks the stretch
+        guard segment.text != lastText else {
+            droppedRepeats += 1
+            return
+        }
+        lastText = segment.text
+
+        let placed = TranscriptSegment(start: start, end: end, text: segment.text)
+        segments.append(placed)
+        onSegment(placed)
     }
 }
 

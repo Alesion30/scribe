@@ -1,0 +1,19 @@
+[tools]
+swift = "6.3"
+swiftlint = "0.65.1"
+
+[tasks.build]
+description = "Build the release binary"
+run = "swift build -c release"
+
+[tasks.test]
+description = "Run the test suite"
+run = "swift test"
+
+[tasks.lint]
+description = "Run SwiftLint the way CI does"
+run = "swiftlint lint --strict"
+
+[tasks.smoke]
+description = "Build and transcribe a fixture to verify the pipeline"
+run = "./scripts/smoke.sh"

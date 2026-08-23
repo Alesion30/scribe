@@ -26,7 +26,7 @@ struct Scribe: AsyncParsableCommand {
             DefaultCommand.self,
             Record.self,
             Transcribe.self,
-            Model.self,
+            Model.self
         ],
         defaultSubcommand: DefaultCommand.self
     )
@@ -99,14 +99,15 @@ extension Scribe {
                 throw ScribeError.noAudioCaptured
             }
 
-            // Transcribe
-            let segments = try await performTranscription(
-                samples: recording.samples,
-                config: config
-            )
+            // Transcribe, streaming segments to the output as they are decoded.
+            let writer = try TranscriptWriter(path: output, format: config.format)
+            defer { writer.close() }
 
-            // Output
-            try writeOutput(config.format.render(segments), to: output)
+            try await performTranscription(
+                samples: recording.samples,
+                config: config,
+                onSegment: writer.write
+            )
 
             if let wav = recording.wavPath {
                 Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
@@ -231,12 +232,14 @@ extension Scribe {
                 Log.status("Range: \(String(format: "%.1f", start))s - \(String(format: "%.1f", end))s")
             }
 
-            let segments = try await performTranscription(
-                samples: samples,
-                config: config
-            )
+            let writer = try TranscriptWriter(path: output, format: config.format)
+            defer { writer.close() }
 
-            try writeOutput(config.format.render(segments), to: output)
+            try await performTranscription(
+                samples: samples,
+                config: config,
+                onSegment: writer.write
+            )
         }
     }
 }
@@ -441,8 +444,16 @@ private func performRecording(
     wavPath: String?,
     config: ResolvedConfig
 ) async throws -> RecordingResult {
-    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem)
+    // Stamp the start before creating source files so every file names the session start.
+    let startedAt = Date()
+    let output = wavPath.map { ($0 as NSString).expandingTildeInPath }
+        ?? defaultWavPath(startedAt: startedAt, in: config.recordingsDir)
+    let paths = RecordingPaths(output: output)
+    try paths.prepareDirectory()
 
+    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem, paths: paths)
+
+    Log.status("Recording to: \(paths.output)")
     Log.status("Recording... Press Ctrl+C to stop.")
 
     // Set up SIGINT handler for graceful stop
@@ -458,9 +469,6 @@ private func performRecording(
         }
     }
 
-    // Stamp the start here: naming the WAV by its end time hides the recorded span.
-    let startedAt = Date()
-
     // Start capture in background
     let captureTask = Task {
         try await capture.startCapture()
@@ -469,9 +477,9 @@ private func performRecording(
     // Wait for SIGINT
     await stopTask.value
 
-    // Stop capture and get samples
+    // Stop capture and close the per-source recordings
     Log.status("") // newline after ^C
-    let samples = capture.stopCapture()
+    let result = capture.stopCapture()
     let endedAt = Date()
     sigintSource.cancel()
     signal(SIGINT, SIG_DFL)
@@ -479,27 +487,30 @@ private func performRecording(
     // Cancel capture task
     captureTask.cancel()
 
-    // Save WAV
-    let resolvedWavPath: String
-    if let explicit = wavPath {
-        resolvedWavPath = (explicit as NSString).expandingTildeInPath
-    } else {
-        resolvedWavPath = defaultWavPath(startedAt: startedAt, in: config.recordingsDir)
+    do {
+        let samples = try RecordingFinalizer.finalize(result, to: paths.output)
+        return RecordingResult(
+            samples: samples,
+            wavPath: samples.isEmpty ? nil : paths.output,
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+    } catch {
+        Log.error("Failed to write \(paths.output): \(error.localizedDescription)")
+        for source in result.sources {
+            Log.status("  Source recording kept: \(source.path)")
+        }
+        throw error
     }
-
-    if !samples.isEmpty {
-        try AudioWriter.writeWAV(samples: samples, to: resolvedWavPath)
-        return RecordingResult(samples: samples, wavPath: resolvedWavPath, startedAt: startedAt, endedAt: endedAt)
-    }
-
-    return RecordingResult(samples: [], wavPath: nil, startedAt: startedAt, endedAt: endedAt)
 }
 
-/// Transcribe audio samples using whisper.cpp.
+/// Transcribe audio samples using whisper.cpp and forward each decoded segment immediately.
 /// Downloads the model first if it is a known model that hasn't been fetched yet.
+@discardableResult
 private func performTranscription(
     samples: [Float],
-    config: ResolvedConfig
+    config: ResolvedConfig,
+    onSegment: @escaping (TranscriptSegment) -> Void
 ) async throws -> [TranscriptSegment] {
     let modelPath = try await ModelManager.ensureModel(config.model)
 
@@ -512,24 +523,12 @@ private func performTranscription(
     let whisper = try WhisperContext(modelPath: modelPath)
 
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
-    let segments = try whisper.transcribe(samples: samples, options: options)
-
-    if Log.verbose {
-        FileHandle.standardError.write(Data("\n".utf8))
-    }
-
-    return segments
-}
-
-/// Write text to file or stdout.
-private func writeOutput(_ text: String, to path: String) throws {
-    if path == "-" {
-        print(text)
-    } else {
-        let expandedPath = (path as NSString).expandingTildeInPath
-        try text.write(toFile: expandedPath, atomically: true, encoding: .utf8)
-        Log.status("Transcript written to: \(expandedPath)")
-    }
+    return try whisper.transcribe(
+        samples: samples,
+        options: options,
+        showProgress: Log.verbose,
+        onSegment: onSegment
+    )
 }
 
 // MARK: - Errors
@@ -539,6 +538,7 @@ enum ScribeError: LocalizedError {
     case fileNotFound(String)
     case unknownModel(String)
     case invalidURL(String)
+    case cannotWriteOutput(String)
     case invalidTimeRange(String)
     case invalidChunkLength(Double)
 
@@ -556,6 +556,8 @@ enum ScribeError: LocalizedError {
                 """
         case .invalidURL(let url):
             return "Invalid URL: \(url)"
+        case .cannotWriteOutput(let path):
+            return "Cannot write transcript to: \(path)"
         case .invalidTimeRange(let reason):
             return "Invalid time range: \(reason)"
         case .invalidChunkLength(let seconds):
