@@ -88,11 +88,9 @@ struct ScribeConfig: Codable {
         let fm = FileManager.default
         let dirs = [Self.scribeHome, Self.modelsDir, resolvedRecordingsDir]
 
-        for dir in dirs {
-            if !fm.fileExists(atPath: dir) {
-                Log.debug("Creating directory: \(dir)")
-                try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            }
+        for dir in dirs where !fm.fileExists(atPath: dir) {
+            Log.debug("Creating directory: \(dir)")
+            try fm.createDirectory(atPath: dir, withIntermediateDirectories: true)
         }
     }
 }

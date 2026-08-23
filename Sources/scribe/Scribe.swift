@@ -26,7 +26,7 @@ struct Scribe: AsyncParsableCommand {
             DefaultCommand.self,
             Record.self,
             Transcribe.self,
-            Model.self,
+            Model.self
         ],
         defaultSubcommand: DefaultCommand.self
     )
@@ -430,7 +430,6 @@ private func performRecording(
             sigintSource.resume()
         }
     }
-
 
     // Start capture in background
     let captureTask = Task {

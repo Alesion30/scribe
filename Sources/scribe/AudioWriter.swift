@@ -411,23 +411,19 @@ struct AudioWriter {
         // Add padding: keep 1 window before and after each voiced window
         let paddingWindows = 1
         var paddedKeep = keepWindow
-        for i in 0..<totalWindows {
-            if keepWindow[i] {
-                for j in max(0, i - paddingWindows)...min(totalWindows - 1, i + paddingWindows) {
-                    paddedKeep[j] = true
-                }
+        for i in 0..<totalWindows where keepWindow[i] {
+            for j in max(0, i - paddingWindows)...min(totalWindows - 1, i + paddingWindows) {
+                paddedKeep[j] = true
             }
         }
 
         // Collect kept samples
         var result = [Float]()
         result.reserveCapacity(samples.count)
-        for i in 0..<totalWindows {
-            if paddedKeep[i] {
-                let start = i * windowSize
-                let end = min(start + windowSize, samples.count)
-                result.append(contentsOf: samples[start..<end])
-            }
+        for i in 0..<totalWindows where paddedKeep[i] {
+            let start = i * windowSize
+            let end = min(start + windowSize, samples.count)
+            result.append(contentsOf: samples[start..<end])
         }
 
         let removedDuration = Double(samples.count - result.count) / sampleRate

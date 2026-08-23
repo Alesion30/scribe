@@ -38,3 +38,15 @@ jobs:
 
       - name: Test
         run: swift test
+
+  lint:
+    name: SwiftLint
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # SwiftLint ships with the runner; print the version so an image bump adding rules is easy to spot.
+      - name: Lint
+        run: |
+          swiftlint version
+          swiftlint lint --strict

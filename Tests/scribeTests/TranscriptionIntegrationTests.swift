@@ -25,7 +25,7 @@ struct TranscriptionIntegrationTests {
         arguments: [
             ("sample_weather_ja", "天気"),
             ("sample_meeting_ja", "会議"),
-            ("sample_thanks_ja", "ありがとう"),
+            ("sample_thanks_ja", "ありがとう")
         ]
     )
     func transcribeJapaneseFixture(fixture: String, keyword: String) throws {
@@ -64,7 +64,7 @@ struct TranscriptionIntegrationTests {
 
 /// Lives outside the suite so `.enabled(if:)` doesn't trigger circular
 /// macro resolution against a static member of the suite itself.
-fileprivate enum TestEnv {
+private enum TestEnv {
     static func resolvedModelPath() -> String {
         let name = ProcessInfo.processInfo.environment["SCRIBE_TEST_MODEL"]
             ?? ScribeConfig.defaultModel

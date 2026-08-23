@@ -290,14 +290,26 @@ Override the model used by integration tests:
 SCRIBE_TEST_MODEL=base swift test
 ```
 
-### CI
+### Lint
 
-`.github/workflows/quality.yml` builds and tests the package for every pull request and every push to `main`, on a GitHub-hosted `macos-15` runner pinned to Xcode 26.3 via `DEVELOPER_DIR`:
+SwiftLint is configured in `.swiftlint.yml` and the tree is clean under it, so anything it reports is something a change introduced:
 
 ```bash
-swift build -c debug
-swift test
+brew install swiftlint   # once
+swiftlint lint --strict  # what CI runs: warnings fail too
+swiftlint --fix          # apply the autocorrectable rules
 ```
+
+The length and identifier limits are relaxed to fit the DSP code, where short loop indices and long signal-processing routines read better than the defaults allow.
+
+### CI
+
+`.github/workflows/quality.yml` runs on every pull request and every push to `main`, on a GitHub-hosted `macos-15` runner pinned to Xcode 26.3 via `DEVELOPER_DIR`:
+
+| Job | Command |
+| --- | --- |
+| Swift build and test | `swift build -c debug`, then `swift test` |
+| SwiftLint | `swiftlint lint --strict` |
 
 The pin matters because the runner otherwise defaults to Xcode 16.4, which accepts code that the newer toolchain rejects. `release.yml` builds with the same version so a green PR cannot fail at release time.
 

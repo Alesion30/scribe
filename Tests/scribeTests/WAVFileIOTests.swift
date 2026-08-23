@@ -186,7 +186,7 @@ struct WAVFileIOTests {
             samples: samples,
             extraChunks: [
                 ("LIST", Data(repeating: 0x20, count: 26)),
-                ("FLLR", Data(repeating: 0x00, count: 4060)),
+                ("FLLR", Data(repeating: 0x00, count: 4060))
             ]
         )
         try Self.withTemporaryFile(wav) { url in
