@@ -40,7 +40,7 @@ enum ModelManager {
         ("small", "465 MB"),
         ("medium", "1.4 GB"),
         ("large-v3-turbo", "1.5 GB"),
-        ("large-v3", "2.9 GB"),
+        ("large-v3", "2.9 GB")
     ]
 
     /// Silero VAD for skipping silence, kept out of the model lists since it cannot transcribe.

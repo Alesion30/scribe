@@ -1,0 +1,27 @@
+included:
+  - Sources
+  - Tests
+
+# 信号処理のループ添字やチャンネル番号は 1〜2 文字のほうが式として読みやすい
+identifier_name:
+  min_length:
+    warning: 1
+    error: 1
+
+line_length:
+  warning: 190
+  error: 250
+
+# 音声処理は途中で切ると信号の流れが追いにくくなるため、既存の規模に合わせて広げている
+file_length:
+  warning: 750
+type_body_length:
+  warning: 500
+function_body_length:
+  warning: 90
+cyclomatic_complexity:
+  warning: 20
+
+# 年月日時分秒のように並びが自明な引数列は、まとめても読みやすくならない
+function_parameter_count:
+  warning: 6

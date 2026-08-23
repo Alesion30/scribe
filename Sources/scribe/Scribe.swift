@@ -99,14 +99,14 @@ extension Scribe {
                 throw ScribeError.noAudioCaptured
             }
 
-            // Transcribe
-            let segments = try await performTranscription(
+            // Write segments as they are decoded, retaining partial output if transcription stops.
+            let writer = try TranscriptWriter(path: output, format: config.format)
+            defer { writer.close() }
+            try await performTranscription(
                 samples: recording.samples,
-                config: config
+                config: config,
+                onSegment: writer.write
             )
-
-            // Output
-            try writeOutput(config.format.render(segments), to: output)
 
             if let wav = recording.wavPath {
                 Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
@@ -231,12 +231,13 @@ extension Scribe {
                 Log.status("Range: \(String(format: "%.1f", start))s - \(String(format: "%.1f", end))s")
             }
 
-            let segments = try await performTranscription(
+            let writer = try TranscriptWriter(path: output, format: config.format)
+            defer { writer.close() }
+            try await performTranscription(
                 samples: samples,
-                config: config
+                config: config,
+                onSegment: writer.write
             )
-
-            try writeOutput(config.format.render(segments), to: output)
         }
     }
 }
@@ -499,7 +500,8 @@ private func performRecording(
 /// Downloads the model first if it is a known model that hasn't been fetched yet.
 private func performTranscription(
     samples: [Float],
-    config: ResolvedConfig
+    config: ResolvedConfig,
+    onSegment: @escaping (TranscriptSegment) -> Void
 ) async throws -> [TranscriptSegment] {
     let modelPath = try await ModelManager.ensureModel(config.model)
 
@@ -512,7 +514,7 @@ private func performTranscription(
     let whisper = try WhisperContext(modelPath: modelPath)
 
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
-    let segments = try whisper.transcribe(samples: samples, options: options)
+    let segments = try whisper.transcribe(samples: samples, options: options, onSegment: onSegment)
 
     if Log.verbose {
         FileHandle.standardError.write(Data("\n".utf8))
@@ -521,16 +523,6 @@ private func performTranscription(
     return segments
 }
 
-/// Write text to file or stdout.
-private func writeOutput(_ text: String, to path: String) throws {
-    if path == "-" {
-        print(text)
-    } else {
-        let expandedPath = (path as NSString).expandingTildeInPath
-        try text.write(toFile: expandedPath, atomically: true, encoding: .utf8)
-        Log.status("Transcript written to: \(expandedPath)")
-    }
-}
 
 // MARK: - Errors
 
@@ -539,6 +531,7 @@ enum ScribeError: LocalizedError {
     case fileNotFound(String)
     case unknownModel(String)
     case invalidURL(String)
+    case cannotWriteOutput(String)
     case invalidTimeRange(String)
     case invalidChunkLength(Double)
 
@@ -556,6 +549,8 @@ enum ScribeError: LocalizedError {
                 """
         case .invalidURL(let url):
             return "Invalid URL: \(url)"
+        case .cannotWriteOutput(let path):
+            return "Cannot write transcript to: \(path)"
         case .invalidTimeRange(let reason):
             return "Invalid time range: \(reason)"
         case .invalidChunkLength(let seconds):

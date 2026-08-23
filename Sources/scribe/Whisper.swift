@@ -58,14 +58,19 @@ final class WhisperContext {
         Log.debug("Whisper context freed")
     }
 
-    /// Transcribe Float PCM samples (16 kHz mono) and return the segments with their timestamps.
-    func transcribe(samples: [Float], options: TranscribeOptions = TranscribeOptions()) throws -> [TranscriptSegment] {
+    /// Transcribe Float PCM samples (16 kHz mono), forwarding each kept segment as it is decoded.
+    func transcribe(
+        samples: [Float],
+        options: TranscribeOptions = TranscribeOptions(),
+        onSegment: @escaping (TranscriptSegment) -> Void = { _ in }
+    ) throws -> [TranscriptSegment] {
         let chunks = Self.chunks(sampleCount: samples.count, options: options)
         if chunks.count > 1 {
             Log.info("Split into \(chunks.count) chunks of \(String(format: "%.0f", options.chunkLength))s")
         }
 
         var segments: [TranscriptSegment] = []
+        var previousText: String?
         for (index, chunk) in chunks.enumerated() {
             let decoded = try decode(
                 samples: samples,
@@ -81,14 +86,19 @@ final class WhisperContext {
                 let start = segment.start + offset
                 let end = segment.end + offset
 
-                // Assign by midpoint so the lead-in never emits the same line twice
+                // Assign by midpoint so the lead-in never emits the same line twice.
                 guard (start + end) / 2 >= ownedStart else { continue }
 
-                segments.append(TranscriptSegment(start: start, end: end, text: segment.text))
+                let emitted = TranscriptSegment(start: start, end: end, text: segment.text)
+                // Do not write a hallucinated repeated line. This check spans chunk boundaries too.
+                guard emitted.text != previousText else { continue }
+                previousText = emitted.text
+                segments.append(emitted)
+                onSegment(emitted)
             }
         }
 
-        return TranscriptSegment.collapsingRepeats(segments)
+        return segments
     }
 
     /// Run `whisper_full` over one range of samples. Timestamps are relative to `range.lowerBound`.
