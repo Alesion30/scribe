@@ -102,8 +102,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
         // Lay each stream out on the host clock. Appending buffers in arrival order would fold the
         // gap between the two capture start times into the mix, doubling whatever both streams heard.
-        var micTrack = AudioTimeline.track(from: micBuffers, sampleRate: micRate, channels: micChannels)
-        var systemTrack = AudioTimeline.track(from: systemBuffers, sampleRate: systemRate, channels: systemChannels)
+        let micTrack = AudioTimeline.track(from: micBuffers, sampleRate: micRate, channels: micChannels)
+        let systemTrack = AudioTimeline.track(from: systemBuffers, sampleRate: systemRate, channels: systemChannels)
 
         if !micTrack.isEmpty {
             Log.debug("Mic track (\(micRate) Hz, \(micChannels)ch -> 16 kHz mono): \(micTrack.samples.count) samples (\(String(format: "%.1f", micTrack.duration))s)")
@@ -116,11 +116,27 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             Log.debug("System audio starts \(String(format: "%+.3f", skew))s relative to the mic")
         }
 
+        let normalized = Self.mixdown(mic: micTrack, system: systemTrack)
+        guard !normalized.isEmpty else {
+            Log.warning("No audio samples captured")
+            return []
+        }
+
+        let duration = Double(normalized.count) / AudioWriter.sampleRate
+        Log.info("Final audio: \(normalized.count) samples (\(String(format: "%.1f", duration))s)")
+
+        return normalized
+    }
+
+    /// Combine the two captured tracks into the single 16 kHz mono track handed to whisper.
+    ///
+    /// Split out of stopCapture() so the mixdown can be exercised without a real capture session.
+    static func mixdown(mic: AudioTrack, system: AudioTrack) -> [Float] {
         // Detect near-silent sources and exclude them from the mix.
         // Prevents amplifying system noise during offline meetings
         // (where no meaningful system audio exists) and vice versa.
-        systemTrack = Self.discardIfSilent(systemTrack, label: "System")
-        micTrack = Self.discardIfSilent(micTrack, label: "Mic")
+        var micTrack = discardIfSilent(mic, label: "Mic")
+        var systemTrack = discardIfSilent(system, label: "System")
 
         // Normalize each source to the same level before mixing
         // so quiet mic doesn't get buried by louder system audio.
@@ -143,7 +159,6 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         } else if !systemTrack.isEmpty {
             mixed = systemTrack.samples
         } else {
-            Log.warning("No audio samples captured")
             return []
         }
 
@@ -151,12 +166,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         let denoised = AudioWriter.reduceNoise(from: mixed)
 
         // Normalize volume (peak → 0.9 to leave headroom)
-        let normalized = AudioWriter.normalize(denoised)
-
-        let duration = Double(normalized.count) / AudioWriter.sampleRate
-        Log.info("Final audio: \(normalized.count) samples (\(String(format: "%.1f", duration))s)")
-
-        return normalized
+        return AudioWriter.normalize(denoised)
     }
 
     // MARK: - Microphone (AVAudioEngine)
@@ -335,7 +345,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     }
 
     /// Drop a source that carries no real audio, so the mix does not amplify its noise floor.
-    private static func discardIfSilent(_ track: AudioTrack, label: String) -> AudioTrack {
+    static func discardIfSilent(_ track: AudioTrack, label: String) -> AudioTrack {
         guard !track.isEmpty else { return track }
 
         var sumSq: Float = 0
