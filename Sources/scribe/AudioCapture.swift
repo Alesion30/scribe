@@ -16,14 +16,18 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
     // ScreenCaptureKit — system audio only
     private var stream: SCStream?
-    private var systemSamples: [Float] = []
+    private var systemChunks: [TimedChunk] = []
     private var sourceSampleRate: Double = 48000
+    private var systemChannelCount: Int = 2
 
     // AVAudioEngine — microphone
     private var audioEngine: AVAudioEngine?
-    private var micSamples: [Float] = []
+    private var micChunks: [TimedChunk] = []
     private var micSampleRate: Double = 48000
     private var micChannelCount: Int = 1
+
+    /// Sources quieter than this carry only noise, so they are left out of the mix.
+    private static let silenceRMSThreshold: Float = 0.01
 
     private var continuation: CheckedContinuation<Void, any Error>?
 
@@ -86,80 +90,58 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         continuation = nil
 
         samplesLock.lock()
-        let rawMic = micSamples
-        let rawSystem = systemSamples
+        let micBuffers = micChunks
+        let systemBuffers = systemChunks
+        let micRate = micSampleRate
+        let micChannels = micChannelCount
+        let systemRate = sourceSampleRate
+        let systemChannels = systemChannelCount
         samplesLock.unlock()
 
-        Log.debug("Raw samples - mic: \(rawMic.count), system: \(rawSystem.count)")
+        Log.debug("Captured buffers - mic: \(micBuffers.count), system: \(systemBuffers.count)")
 
-        // Resample both streams to 16kHz mono
-        var resampledMic: [Float] = []
-        var resampledSystem: [Float] = []
+        // Lay each stream out on the host clock. Appending buffers in arrival order would fold the
+        // gap between the two capture start times into the mix, doubling whatever both streams heard.
+        var micTrack = AudioTimeline.track(from: micBuffers, sampleRate: micRate, channels: micChannels)
+        var systemTrack = AudioTimeline.track(from: systemBuffers, sampleRate: systemRate, channels: systemChannels)
 
-        if !rawMic.isEmpty {
-            if let resampled = AudioWriter.resample(rawMic, fromRate: micSampleRate, channels: micChannelCount) {
-                resampledMic = resampled
-                Log.debug("Resampled mic (\(micSampleRate) Hz, \(micChannelCount)ch -> 16 kHz mono): \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
-            } else {
-                Log.warning("Failed to resample microphone audio")
-            }
+        if !micTrack.isEmpty {
+            Log.debug("Mic track (\(micRate) Hz, \(micChannels)ch -> 16 kHz mono): \(micTrack.samples.count) samples (\(String(format: "%.1f", micTrack.duration))s)")
         }
-
-        if !rawSystem.isEmpty {
-            if let resampled = AudioWriter.resample(rawSystem, fromRate: sourceSampleRate, channels: 2) {
-                resampledSystem = resampled
-                Log.debug("Resampled system: \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
-            } else {
-                Log.warning("Failed to resample system audio")
-            }
+        if !systemTrack.isEmpty {
+            Log.debug("System track (\(systemRate) Hz, \(systemChannels)ch -> 16 kHz mono): \(systemTrack.samples.count) samples (\(String(format: "%.1f", systemTrack.duration))s)")
+        }
+        if !micTrack.isEmpty && !systemTrack.isEmpty {
+            let skew = systemTrack.startSeconds - micTrack.startSeconds
+            Log.debug("System audio starts \(String(format: "%+.3f", skew))s relative to the mic")
         }
 
         // Detect near-silent sources and exclude them from the mix.
         // Prevents amplifying system noise during offline meetings
         // (where no meaningful system audio exists) and vice versa.
-        let silenceRMSThreshold: Float = 0.01
-        if !resampledSystem.isEmpty {
-            var sumSq: Float = 0
-            vDSP_svesq(resampledSystem, 1, &sumSq, vDSP_Length(resampledSystem.count))
-            let rms = sqrtf(sumSq / Float(resampledSystem.count))
-            if rms < silenceRMSThreshold {
-                Log.info("System audio is near-silent (RMS=\(String(format: "%.5f", rms))), excluding from mix")
-                resampledSystem = []
-            } else {
-                Log.debug("System audio RMS: \(String(format: "%.5f", rms))")
-            }
-        }
-        if !resampledMic.isEmpty {
-            var sumSq: Float = 0
-            vDSP_svesq(resampledMic, 1, &sumSq, vDSP_Length(resampledMic.count))
-            let rms = sqrtf(sumSq / Float(resampledMic.count))
-            if rms < silenceRMSThreshold {
-                Log.info("Mic audio is near-silent (RMS=\(String(format: "%.5f", rms))), excluding from mix")
-                resampledMic = []
-            } else {
-                Log.debug("Mic audio RMS: \(String(format: "%.5f", rms))")
-            }
-        }
+        systemTrack = Self.discardIfSilent(systemTrack, label: "System")
+        micTrack = Self.discardIfSilent(micTrack, label: "Mic")
 
         // Normalize each source to the same level before mixing
         // so quiet mic doesn't get buried by louder system audio.
         let mixTarget: Float = 0.5
-        if !resampledMic.isEmpty {
-            resampledMic = AudioWriter.normalize(resampledMic, targetPeak: mixTarget)
+        if !micTrack.isEmpty {
+            micTrack = micTrack.with(samples: AudioWriter.normalize(micTrack.samples, targetPeak: mixTarget))
         }
-        if !resampledSystem.isEmpty {
-            resampledSystem = AudioWriter.normalize(resampledSystem, targetPeak: mixTarget)
+        if !systemTrack.isEmpty {
+            systemTrack = systemTrack.with(samples: AudioWriter.normalize(systemTrack.samples, targetPeak: mixTarget))
         }
 
-        // Mix mic and system audio
+        // Mix mic and system audio, lined up by when each stream actually started
         let mixed: [Float]
-        if !resampledMic.isEmpty && !resampledSystem.isEmpty {
-            mixed = AudioWriter.mix(resampledMic, resampledSystem)
+        if !micTrack.isEmpty && !systemTrack.isEmpty {
+            let (alignedMic, alignedSystem) = AudioTimeline.align(micTrack, systemTrack)
+            mixed = AudioWriter.mix(alignedMic.samples, alignedSystem.samples)
             Log.debug("Mixed audio: \(mixed.count) samples")
-        } else if !resampledMic.isEmpty {
-            mixed = resampledMic
-        } else if !resampledSystem.isEmpty {
-            mixed = resampledSystem
+        } else if !micTrack.isEmpty {
+            mixed = micTrack.samples
+        } else if !systemTrack.isEmpty {
+            mixed = systemTrack.samples
         } else {
             Log.warning("No audio samples captured")
             return []
@@ -192,8 +174,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         micChannelCount = Int(format.channelCount)
         Log.debug("Microphone format: \(micSampleRate) Hz, \(micChannelCount) channel(s)")
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-            self?.handleMicBuffer(buffer)
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, time in
+            self?.handleMicBuffer(buffer, at: time)
         }
 
         engine.prepare()
@@ -210,7 +192,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         Log.info("Microphone capture started (AVAudioEngine)")
     }
 
-    private func handleMicBuffer(_ buffer: AVAudioPCMBuffer) {
+    private func handleMicBuffer(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime) {
         guard let channelData = buffer.floatChannelData else { return }
         let frameCount = Int(buffer.frameLength)
         let channels = Int(buffer.format.channelCount)
@@ -231,13 +213,18 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             samples = interleaved
         }
 
+        // AVAudioEngine normally stamps the tap against the host clock; fall back if it does not.
+        let startSeconds = time.isHostTimeValid
+            ? AVAudioTime.seconds(forHostTime: time.hostTime)
+            : Self.arrivalStart(frames: frameCount, sampleRate: micSampleRate)
+
         samplesLock.lock()
-        micSamples.append(contentsOf: samples)
-        let total = micSamples.count
+        micChunks.append(TimedChunk(startSeconds: startSeconds, samples: samples))
+        let total = micChunks.count
         samplesLock.unlock()
 
-        if total % 100000 < frameCount * channels {
-            Log.debug("Mic audio: \(total) samples buffered (\(micSampleRate) Hz)")
+        if total.isMultiple(of: 250) {
+            Log.debug("Mic audio: \(total) buffers captured (\(micSampleRate) Hz)")
         }
     }
 
@@ -303,18 +290,29 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         guard let samples = AudioWriter.extractSamples(from: sampleBuffer) else { return }
 
         var bufferSampleRate = sourceSampleRate
+        var bufferChannels = systemChannelCount
         if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
            let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
             bufferSampleRate = asbd.pointee.mSampleRate
+            bufferChannels = Int(asbd.pointee.mChannelsPerFrame)
         }
+        guard bufferSampleRate > 0, bufferChannels > 0 else { return }
+
+        // ScreenCaptureKit stamps against the host clock — the same one AVAudioEngine uses for the mic.
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let startSeconds = pts.isValid
+            ? AVAudioTime.seconds(forHostTime: CMClockConvertHostTimeToSystemUnits(pts))
+            : Self.arrivalStart(frames: samples.count / bufferChannels, sampleRate: bufferSampleRate)
 
         samplesLock.lock()
-        systemSamples.append(contentsOf: samples)
-        let total = systemSamples.count
+        sourceSampleRate = bufferSampleRate
+        systemChannelCount = bufferChannels
+        systemChunks.append(TimedChunk(startSeconds: startSeconds, samples: samples))
+        let total = systemChunks.count
         samplesLock.unlock()
 
-        if total % 100000 < samples.count {
-            Log.debug("System audio: \(total) samples buffered (\(bufferSampleRate) Hz)")
+        if total.isMultiple(of: 250) {
+            Log.debug("System audio: \(total) buffers captured (\(bufferSampleRate) Hz, \(bufferChannels)ch)")
         }
     }
 
@@ -328,6 +326,30 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     }
 
     // MARK: - Private
+
+    /// Host-clock instant of a buffer's first frame, worked back from when the buffer arrived.
+    private static func arrivalStart(frames: Int, sampleRate: Double) -> Double {
+        let now = AVAudioTime.seconds(forHostTime: mach_absolute_time())
+        guard sampleRate > 0 else { return now }
+        return now - Double(frames) / sampleRate
+    }
+
+    /// Drop a source that carries no real audio, so the mix does not amplify its noise floor.
+    private static func discardIfSilent(_ track: AudioTrack, label: String) -> AudioTrack {
+        guard !track.isEmpty else { return track }
+
+        var sumSq: Float = 0
+        vDSP_svesq(track.samples, 1, &sumSq, vDSP_Length(track.samples.count))
+        let rms = sqrtf(sumSq / Float(track.samples.count))
+
+        guard rms < silenceRMSThreshold else {
+            Log.debug("\(label) audio RMS: \(String(format: "%.5f", rms))")
+            return track
+        }
+
+        Log.info("\(label) audio is near-silent (RMS=\(String(format: "%.5f", rms))), excluding from mix")
+        return .empty
+    }
 
     private func handlePermissionError(_ error: any Error) {
         let nsError = error as NSError
