@@ -134,8 +134,12 @@ final class StreamingWAVWriter {
         }
 
         var pcm = [Int16](repeating: 0, count: count)
-        for i in 0..<count {
-            pcm[i] = Int16(max(-32768, min(32767, Int32(scaled[i])))).littleEndian
+        scaled.withUnsafeBufferPointer { source in
+            pcm.withUnsafeMutableBufferPointer { destination in
+                guard let sourceBase = source.baseAddress, let destinationBase = destination.baseAddress else { return }
+                // The clip above bounds this to Int16's representable range.
+                vDSP_vfix16(sourceBase, 1, destinationBase, 1, vDSP_Length(count))
+            }
         }
 
         return pcm.withUnsafeBufferPointer { Data(buffer: $0) }

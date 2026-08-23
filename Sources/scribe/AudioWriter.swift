@@ -438,6 +438,27 @@ struct AudioWriter {
         return result
     }
 
+    // MARK: - Slicing
+
+    /// Extract a time range from 16kHz mono samples.
+    /// A range running past the end is clamped to the last sample, mirroring `ffmpeg -t`.
+    static func slice(_ samples: [Float], startSeconds: Double, durationSeconds: Double? = nil) -> [Float] {
+        guard !samples.isEmpty else { return [] }
+
+        // Clamp in seconds first: converting an out-of-range Double to Int traps.
+        let totalSamples = Double(samples.count)
+        let start = Int(min(max(0, startSeconds * sampleRate), totalSamples))
+
+        let end: Int
+        if let durationSeconds {
+            end = Int(min(Double(start) + max(0, durationSeconds) * sampleRate, totalSamples))
+        } else {
+            end = samples.count
+        }
+
+        return Array(samples[start..<end])
+    }
+
     // MARK: - WAV File I/O
 
     /// Samples converted per write when streaming a whole buffer to disk.
@@ -522,7 +543,7 @@ struct AudioWriter {
         return monoSamples
     }
 
-    private static func readRawWAV(from url: URL) throws -> [Float] {
+    static func readRawWAV(from url: URL) throws -> [Float] {
         let fileData = try Data(contentsOf: url)
         guard fileData.count >= 44 else {
             throw AudioWriterError.invalidWAVHeader("File too small for WAV header")
@@ -568,34 +589,42 @@ struct AudioWriter {
             throw AudioWriterError.invalidWAVHeader("No data chunk found")
         }
 
-        let bytesPerSample = Int(bitsPerSample) / 8
-        let sampleCount = Int(dataSize) / bytesPerSample
-
-        var floats: [Float]
-        if bitsPerSample == 16 {
-            let int16Count = sampleCount
-            floats = [Float](repeating: 0, count: int16Count)
-            for i in 0..<int16Count {
-                let offset = dataOffset + i * 2
-                guard offset + 1 < fileData.count else { break }
-                let value: Int16 = fileData.readLittleEndian(at: offset)
-                floats[i] = Float(value) / 32768.0
-            }
-        } else {
+        // Checked before bitsPerSample becomes a divisor, so a malformed zero depth cannot trap
+        guard bitsPerSample == 16 else {
             throw AudioWriterError.invalidWAVHeader("Unsupported bit depth: \(bitsPerSample)")
         }
 
+        let bytesPerSample = Int(bitsPerSample) / 8
+        let sampleCount = Int(dataSize) / bytesPerSample
+
+        // A truncated file can declare more samples than it stores; the missing tail stays silent
+        let readCount = min(sampleCount, (fileData.count - dataOffset) / bytesPerSample)
+        var pcm = [Int16](repeating: 0, count: sampleCount)
+        _ = pcm.withUnsafeMutableBytes {
+            fileData.copyBytes(to: $0, from: dataOffset..<(dataOffset + readCount * bytesPerSample))
+        }
+
+        var floats = [Float](repeating: 0, count: sampleCount)
+        vDSP_vflt16(pcm, 1, &floats, 1, vDSP_Length(sampleCount))
+        var divisor: Float = 32768.0
+        vDSP_vsdiv(floats, 1, &divisor, &floats, 1, vDSP_Length(sampleCount))
+
         // Mix to mono if multi-channel
-        if numChannels > 1 {
-            let frameCount = floats.count / Int(numChannels)
+        let channels = Int(numChannels)
+        if channels > 1 {
+            let frameCount = floats.count / channels
             var mono = [Float](repeating: 0, count: frameCount)
-            for frame in 0..<frameCount {
-                var sum: Float = 0
-                for ch in 0..<Int(numChannels) {
-                    sum += floats[frame * Int(numChannels) + ch]
+            floats.withUnsafeBufferPointer { src in
+                mono.withUnsafeMutableBufferPointer { dst in
+                    guard let input = src.baseAddress, let output = dst.baseAddress else { return }
+                    // Each channel is a strided view into the interleaved buffer
+                    for ch in 0..<channels {
+                        vDSP_vadd(output, 1, input + ch, vDSP_Stride(channels), output, 1, vDSP_Length(frameCount))
+                    }
                 }
-                mono[frame] = sum / Float(numChannels)
             }
+            var divisor = Float(channels)
+            vDSP_vsdiv(mono, 1, &divisor, &mono, 1, vDSP_Length(frameCount))
             floats = mono
         }
 
