@@ -19,7 +19,8 @@ struct Scribe: AsyncParsableCommand {
         discussion: """
             Record audio from the microphone and/or system audio using ScreenCaptureKit, \
             then transcribe with a local whisper model. \
-            Run without a subcommand to record and transcribe in one step.
+            Run without a subcommand to record and transcribe in one step; \
+            the recording is deleted once the transcript is written, unless you pass --keep-audio or -w.
             """,
         version: "0.1.0",
         subcommands: [
@@ -50,7 +51,7 @@ extension Scribe {
         @Option(name: .shortAndLong, help: "Output file for transcript (- for stdout).")
         var output: String = "-"
 
-        @Option(name: [.customShort("w"), .long], help: "WAV file save path.")
+        @Option(name: [.customShort("w"), .long], help: "WAV file save path. A recording saved here is kept.")
         var wavPath: String?
 
         @Option(name: .shortAndLong, help: "Language hint (ISO 639-1, e.g. ja, en). 'auto' for detection.")
@@ -70,6 +71,9 @@ extension Scribe {
 
         @Flag(name: .long, help: "Disable system audio (microphone only).")
         var noSystem: Bool = false
+
+        @Flag(name: .long, help: "Keep the recording instead of deleting it after transcribing.")
+        var keepAudio: Bool = false
 
         mutating func run() async throws {
             let config = try resolveConfig(
@@ -110,7 +114,12 @@ extension Scribe {
             )
 
             if let wav = recording.wavPath {
-                Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
+                let deleted = try disposeRecording(at: wav, userSpecifiedWavPath: wavPath, keepAudio: keepAudio)
+                if deleted {
+                    Log.status("Recording deleted after transcription (\(recording.spanDescription))")
+                } else {
+                    Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
+                }
             }
         }
     }
@@ -121,7 +130,7 @@ extension Scribe {
 extension Scribe {
     struct Record: AsyncParsableCommand {
         static let configuration = CommandConfiguration(
-            abstract: "Record audio and save as WAV (no transcription)."
+            abstract: "Record audio and save as WAV (no transcription). The WAV is always kept."
         )
 
         @OptionGroup var global: GlobalOptions
@@ -437,6 +446,20 @@ func formatDuration(_ seconds: Int) -> String {
     return "\(remainder)s"
 }
 
+/// Drop the recording now that the transcript is written. Returns true when the file was deleted.
+///
+/// Only a path scribe picked itself is deleted; a location the user named is theirs to keep.
+func disposeRecording(at path: String, userSpecifiedWavPath: String?, keepAudio: Bool) throws -> Bool {
+    guard userSpecifiedWavPath == nil, !keepAudio else { return false }
+
+    do {
+        try FileManager.default.removeItem(atPath: path)
+    } catch {
+        throw ScribeError.recordingCleanupFailed(path: path, reason: error.localizedDescription)
+    }
+    return true
+}
+
 /// Record audio, save WAV, return the session result.
 private func performRecording(
     captureMic: Bool,
@@ -541,6 +564,7 @@ enum ScribeError: LocalizedError {
     case cannotWriteOutput(String)
     case invalidTimeRange(String)
     case invalidChunkLength(Double)
+    case recordingCleanupFailed(path: String, reason: String)
 
     var errorDescription: String? {
         switch self {
@@ -562,6 +586,11 @@ enum ScribeError: LocalizedError {
             return "Invalid time range: \(reason)"
         case .invalidChunkLength(let seconds):
             return "Invalid --chunk-length \(seconds): must be zero or greater"
+        case .recordingCleanupFailed(let path, let reason):
+            return """
+                Transcription finished, but the recording could not be deleted: \(reason)
+                The recording is still at: \(path)
+                """
         }
     }
 }
