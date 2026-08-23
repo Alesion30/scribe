@@ -290,6 +290,17 @@ Override the model used by integration tests:
 SCRIBE_TEST_MODEL=base swift test
 ```
 
+### CI
+
+`.github/workflows/quality.yml` builds and tests the package on a GitHub-hosted `macos-15` runner for every pull request and every push to `main`:
+
+```bash
+swift build -c debug
+swift test
+```
+
+The runner has no whisper model installed, so `TranscriptionIntegrationTests` is skipped there and CI covers the unit suites only. Real transcription stays a local check — run `./scripts/smoke.sh` below, or set `SCRIBE_TEST_MODEL` as shown above to run the integration suite against a model you already have.
+
 ### Smoke Test
 
 A one-shot script that builds the release binary and verifies a known fixture transcribes correctly:
