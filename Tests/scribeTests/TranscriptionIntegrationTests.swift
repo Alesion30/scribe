@@ -6,7 +6,8 @@ import Testing
 ///
 /// Reads Japanese WAV fixtures (generated via `scripts/generate-fixtures.sh`),
 /// runs them through `AudioWriter.readWAV` + `WhisperContext.transcribe`, and
-/// verifies that each transcript contains an expected keyword.
+/// verifies that each transcript contains an expected keyword and carries
+/// sane segment timestamps.
 ///
 /// Disabled when the configured whisper model is missing locally, so fresh
 /// checkouts (e.g. CI) don't fail. Override the model with
@@ -40,10 +41,23 @@ struct TranscriptionIntegrationTests {
         #expect(samples.count > 0, "Fixture has no samples")
 
         let whisper = try WhisperContext(modelPath: TestEnv.resolvedModelPath())
-        let text = try whisper.transcribe(samples: samples, language: "ja")
+        let segments = try whisper.transcribe(samples: samples, language: "ja")
+        #expect(!segments.isEmpty, "Transcription produced no segments")
+
+        let text = TranscriptFormat.txt.render(segments)
         #expect(
             text.contains(keyword),
             "Transcript should contain '\(keyword)'. Got: \(text)"
+        )
+
+        // Timestamps are what make the transcript navigable, so guard their basic sanity here too.
+        for segment in segments {
+            #expect(segment.start >= 0, "Segment start must not be negative: \(segment)")
+            #expect(segment.end >= segment.start, "Segment must not end before it starts: \(segment)")
+        }
+        #expect(
+            zip(segments, segments.dropFirst()).allSatisfy { $0.start <= $1.start },
+            "Segments should be ordered by start time. Got: \(segments)"
         )
     }
 }

@@ -8,6 +8,7 @@ struct ScribeConfig: Codable {
     var recordingDir: String?
     var noMic: Bool?
     var noSystem: Bool?
+    var format: TranscriptFormat?
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -15,17 +16,20 @@ struct ScribeConfig: Codable {
         case recordingDir
         case noMic
         case noSystem
+        case format
     }
 
     // MARK: - Defaults
 
     static let defaultModel = "large-v3-turbo"
     static let defaultLanguage = "auto"
+    static let defaultFormat = TranscriptFormat.txt
 
     var resolvedModel: String { model ?? Self.defaultModel }
     var resolvedLanguage: String { language ?? Self.defaultLanguage }
     var resolvedNoMic: Bool { noMic ?? false }
     var resolvedNoSystem: Bool { noSystem ?? false }
+    var resolvedFormat: TranscriptFormat { format ?? Self.defaultFormat }
 
     // MARK: - Directories
 
@@ -73,7 +77,7 @@ struct ScribeConfig: Codable {
         let data = try Data(contentsOf: URL(fileURLWithPath: configPath))
         let decoder = JSONDecoder()
         let config = try decoder.decode(ScribeConfig.self, from: data)
-        Log.debug("Config loaded: model=\(config.resolvedModel), language=\(config.resolvedLanguage)")
+        Log.debug("Config loaded: model=\(config.resolvedModel), language=\(config.resolvedLanguage), format=\(config.resolvedFormat.rawValue)")
         return config
     }
 

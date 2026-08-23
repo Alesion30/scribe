@@ -10,29 +10,31 @@ import Accelerate
 /// from initiating screen sharing while scribe is recording. By isolating
 /// mic capture to AVAudioEngine, mic-only sessions touch ScreenCaptureKit
 /// not at all, and mic+system sessions only run an audio-only SCStream.
+///
+/// Samples are streamed to one WAV per source as they arrive, so memory stays
+/// flat and a crash leaves everything recorded so far on disk.
 final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let captureMic: Bool
     let captureSystem: Bool
 
+    private let paths: RecordingPaths
+
     // ScreenCaptureKit — system audio only
     private var stream: SCStream?
-    private var systemSamples: [Float] = []
+    private var systemRecorder: SourceRecorder?
     private var sourceSampleRate: Double = 48000
+    private var didWarnSampleRateMismatch = false
 
     // AVAudioEngine — microphone
     private var audioEngine: AVAudioEngine?
-    private var micSamples: [Float] = []
-    private var micSampleRate: Double = 48000
-    private var micChannelCount: Int = 1
+    private var micRecorder: SourceRecorder?
 
     private var continuation: CheckedContinuation<Void, any Error>?
 
-    // Mic and system audio arrive on independent threads — guard the buffers.
-    private let samplesLock = NSLock()
-
-    init(captureMic: Bool = true, captureSystem: Bool = true) {
+    init(captureMic: Bool = true, captureSystem: Bool = true, paths: RecordingPaths) {
         self.captureMic = captureMic
         self.captureSystem = captureSystem
+        self.paths = paths
         super.init()
     }
 
@@ -56,8 +58,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         }
     }
 
-    /// Stop capturing and return the mixed, resampled audio samples.
-    func stopCapture() -> [Float] {
+    /// Stop capturing and close the per-source recordings.
+    func stopCapture() -> CaptureResult {
         Log.info("Stopping audio capture...")
 
         // Stop microphone (AVAudioEngine)
@@ -85,96 +87,12 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         continuation?.resume()
         continuation = nil
 
-        samplesLock.lock()
-        let rawMic = micSamples
-        let rawSystem = systemSamples
-        samplesLock.unlock()
+        let mic = micRecorder?.finish()
+        let system = systemRecorder?.finish()
+        micRecorder = nil
+        systemRecorder = nil
 
-        Log.debug("Raw samples - mic: \(rawMic.count), system: \(rawSystem.count)")
-
-        // Resample both streams to 16kHz mono
-        var resampledMic: [Float] = []
-        var resampledSystem: [Float] = []
-
-        if !rawMic.isEmpty {
-            if let resampled = AudioWriter.resample(rawMic, fromRate: micSampleRate, channels: micChannelCount) {
-                resampledMic = resampled
-                Log.debug("Resampled mic (\(micSampleRate) Hz, \(micChannelCount)ch -> 16 kHz mono): \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
-            } else {
-                Log.warning("Failed to resample microphone audio")
-            }
-        }
-
-        if !rawSystem.isEmpty {
-            if let resampled = AudioWriter.resample(rawSystem, fromRate: sourceSampleRate, channels: 2) {
-                resampledSystem = resampled
-                Log.debug("Resampled system: \(resampled.count) samples (\(String(format: "%.1f", Double(resampled.count) / AudioWriter.sampleRate))s)")
-            } else {
-                Log.warning("Failed to resample system audio")
-            }
-        }
-
-        // Detect near-silent sources and exclude them from the mix.
-        // Prevents amplifying system noise during offline meetings
-        // (where no meaningful system audio exists) and vice versa.
-        let silenceRMSThreshold: Float = 0.01
-        if !resampledSystem.isEmpty {
-            var sumSq: Float = 0
-            vDSP_svesq(resampledSystem, 1, &sumSq, vDSP_Length(resampledSystem.count))
-            let rms = sqrtf(sumSq / Float(resampledSystem.count))
-            if rms < silenceRMSThreshold {
-                Log.info("System audio is near-silent (RMS=\(String(format: "%.5f", rms))), excluding from mix")
-                resampledSystem = []
-            } else {
-                Log.debug("System audio RMS: \(String(format: "%.5f", rms))")
-            }
-        }
-        if !resampledMic.isEmpty {
-            var sumSq: Float = 0
-            vDSP_svesq(resampledMic, 1, &sumSq, vDSP_Length(resampledMic.count))
-            let rms = sqrtf(sumSq / Float(resampledMic.count))
-            if rms < silenceRMSThreshold {
-                Log.info("Mic audio is near-silent (RMS=\(String(format: "%.5f", rms))), excluding from mix")
-                resampledMic = []
-            } else {
-                Log.debug("Mic audio RMS: \(String(format: "%.5f", rms))")
-            }
-        }
-
-        // Normalize each source to the same level before mixing
-        // so quiet mic doesn't get buried by louder system audio.
-        let mixTarget: Float = 0.5
-        if !resampledMic.isEmpty {
-            resampledMic = AudioWriter.normalize(resampledMic, targetPeak: mixTarget)
-        }
-        if !resampledSystem.isEmpty {
-            resampledSystem = AudioWriter.normalize(resampledSystem, targetPeak: mixTarget)
-        }
-
-        // Mix mic and system audio
-        let mixed: [Float]
-        if !resampledMic.isEmpty && !resampledSystem.isEmpty {
-            mixed = AudioWriter.mix(resampledMic, resampledSystem)
-            Log.debug("Mixed audio: \(mixed.count) samples")
-        } else if !resampledMic.isEmpty {
-            mixed = resampledMic
-        } else if !resampledSystem.isEmpty {
-            mixed = resampledSystem
-        } else {
-            Log.warning("No audio samples captured")
-            return []
-        }
-
-        // Reduce background noise before amplification
-        let denoised = AudioWriter.reduceNoise(from: mixed)
-
-        // Normalize volume (peak → 0.9 to leave headroom)
-        let normalized = AudioWriter.normalize(denoised)
-
-        let duration = Double(normalized.count) / AudioWriter.sampleRate
-        Log.info("Final audio: \(normalized.count) samples (\(String(format: "%.1f", duration))s)")
-
-        return normalized
+        return CaptureResult(mic: mic, system: system)
     }
 
     // MARK: - Microphone (AVAudioEngine)
@@ -188,9 +106,16 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             throw AudioCaptureError.invalidMicrophoneFormat
         }
 
-        micSampleRate = format.sampleRate
-        micChannelCount = Int(format.channelCount)
-        Log.debug("Microphone format: \(micSampleRate) Hz, \(micChannelCount) channel(s)")
+        let channelCount = Int(format.channelCount)
+        Log.debug("Microphone format: \(format.sampleRate) Hz, \(channelCount) channel(s)")
+
+        let recorder = try SourceRecorder(
+            label: "Mic",
+            path: paths.mic,
+            sampleRate: format.sampleRate,
+            channels: channelCount
+        )
+        self.micRecorder = recorder
 
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             self?.handleMicBuffer(buffer)
@@ -202,6 +127,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             try engine.start()
         } catch {
             inputNode.removeTap(onBus: 0)
+            recorder.discard()
+            self.micRecorder = nil
             handleMicrophonePermissionError(error)
             throw error
         }
@@ -220,7 +147,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         if channels == 1 {
             samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameCount))
         } else {
-            // Interleave (L,R,L,R,...) so AudioWriter.resample can deinterleave.
+            // Interleave (L,R,L,R,...) so the resampler can deinterleave.
             var interleaved = [Float](repeating: 0, count: frameCount * channels)
             for ch in 0..<channels {
                 let src = channelData[ch]
@@ -231,14 +158,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             samples = interleaved
         }
 
-        samplesLock.lock()
-        micSamples.append(contentsOf: samples)
-        let total = micSamples.count
-        samplesLock.unlock()
-
-        if total % 100000 < frameCount * channels {
-            Log.debug("Mic audio: \(total) samples buffered (\(micSampleRate) Hz)")
-        }
+        micRecorder?.append(samples)
     }
 
     // MARK: - System Audio (ScreenCaptureKit)
@@ -275,16 +195,26 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1) // 1 FPS minimum
 
+        let recorder = try SourceRecorder(
+            label: "System",
+            path: paths.system,
+            sampleRate: sourceSampleRate,
+            channels: Int(config.channelCount)
+        )
+        self.systemRecorder = recorder
+
         let captureStream = SCStream(filter: filter, configuration: config, delegate: self)
         self.stream = captureStream
 
         let queue = DispatchQueue(label: "com.scribe.audio-capture", qos: .userInitiated)
-        try captureStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
-        Log.debug("Added system audio output")
-
         do {
+            try captureStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: queue)
+            Log.debug("Added system audio output")
             try await captureStream.startCapture()
         } catch {
+            self.stream = nil
+            recorder.discard()
+            self.systemRecorder = nil
             handlePermissionError(error)
             throw error
         }
@@ -302,20 +232,16 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
         guard let samples = AudioWriter.extractSamples(from: sampleBuffer) else { return }
 
-        var bufferSampleRate = sourceSampleRate
-        if let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-            bufferSampleRate = asbd.pointee.mSampleRate
+        // The resampler is built for the configured rate, so a mismatch would skew playback speed.
+        if !didWarnSampleRateMismatch,
+           let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc),
+           asbd.pointee.mSampleRate != sourceSampleRate {
+            didWarnSampleRateMismatch = true
+            Log.warning("System audio arrived at \(asbd.pointee.mSampleRate) Hz, expected \(sourceSampleRate) Hz")
         }
 
-        samplesLock.lock()
-        systemSamples.append(contentsOf: samples)
-        let total = systemSamples.count
-        samplesLock.unlock()
-
-        if total % 100000 < samples.count {
-            Log.debug("System audio: \(total) samples buffered (\(bufferSampleRate) Hz)")
-        }
+        systemRecorder?.append(samples)
     }
 
     // MARK: - SCStreamDelegate
@@ -354,11 +280,117 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     }
 }
 
+// MARK: - Source Recorder
+
+/// Resamples one capture source to 16 kHz mono and streams it to its own WAV.
+///
+/// Conversion and file I/O run on a private queue, so the audio callbacks only
+/// copy their buffer and return and a slow disk can't stall capture.
+final class SourceRecorder: @unchecked Sendable {
+    let label: String
+    let path: String
+
+    private let queue: DispatchQueue
+    private let resampler: StreamingResampler
+    private let writer: StreamingWAVWriter
+
+    // Running levels, so the mix gains can be chosen without re-reading the file.
+    private var peak: Float = 0
+    private var sumSquares: Double = 0
+
+    private var writeFailure: (any Error)?
+    private var lastLoggedSampleCount = 0
+
+    init(label: String, path: String, sampleRate: Double, channels: Int) throws {
+        guard let resampler = StreamingResampler(sampleRate: sampleRate, channels: channels) else {
+            throw AudioCaptureError.unsupportedSourceFormat(label)
+        }
+
+        self.label = label
+        self.path = path
+        self.resampler = resampler
+        self.writer = try StreamingWAVWriter(path: path)
+        self.queue = DispatchQueue(label: "com.scribe.recorder.\(label.lowercased())", qos: .userInitiated)
+
+        Log.debug("\(label) recording to \(path) (\(sampleRate) Hz, \(channels)ch -> 16 kHz mono)")
+    }
+
+    /// Hand off one interleaved buffer. Returns immediately.
+    func append(_ interleaved: [Float]) {
+        guard !interleaved.isEmpty else { return }
+        queue.async { [self] in process(interleaved) }
+    }
+
+    /// Drain pending writes, close the file, and report what was captured.
+    func finish() -> CapturedSource? {
+        queue.sync {}
+
+        do {
+            try writer.finalize()
+        } catch {
+            Log.error("Failed to finalize \(label) recording: \(error.localizedDescription)")
+        }
+
+        let count = writer.sampleCount
+        guard count > 0 else {
+            try? FileManager.default.removeItem(atPath: path)
+            return nil
+        }
+
+        let duration = Double(count) / AudioWriter.sampleRate
+        Log.debug("\(label) captured: \(count) samples (\(String(format: "%.1f", duration))s)")
+
+        return CapturedSource(
+            path: path,
+            sampleCount: count,
+            peak: peak,
+            rms: Float((sumSquares / Double(count)).squareRoot())
+        )
+    }
+
+    /// Close and delete the file, for a source that failed to start.
+    func discard() {
+        queue.sync {}
+        try? writer.finalize()
+        try? FileManager.default.removeItem(atPath: path)
+    }
+
+    // MARK: - Private
+
+    private func process(_ interleaved: [Float]) {
+        guard writeFailure == nil else { return }
+        guard let resampled = resampler.resample(interleaved), !resampled.isEmpty else { return }
+
+        var chunkPeak: Float = 0
+        vDSP_maxmgv(resampled, 1, &chunkPeak, vDSP_Length(resampled.count))
+        peak = max(peak, chunkPeak)
+
+        var sumSq: Float = 0
+        vDSP_svesq(resampled, 1, &sumSq, vDSP_Length(resampled.count))
+        sumSquares += Double(sumSq)
+
+        do {
+            try writer.append(resampled)
+        } catch {
+            // Stop writing but keep the file: what already reached disk is still worth having.
+            writeFailure = error
+            Log.error("\(label) recording stopped writing: \(error.localizedDescription)")
+            return
+        }
+
+        if writer.sampleCount - lastLoggedSampleCount >= 100000 {
+            lastLoggedSampleCount = writer.sampleCount
+            Log.debug("\(label) audio: \(writer.sampleCount) samples written")
+        }
+    }
+}
+
 // MARK: - Errors
 
 enum AudioCaptureError: LocalizedError {
     case noDisplayFound
     case invalidMicrophoneFormat
+    case unsupportedSourceFormat(String)
 
     var errorDescription: String? {
         switch self {
@@ -366,6 +398,8 @@ enum AudioCaptureError: LocalizedError {
             return "No display found for audio capture"
         case .invalidMicrophoneFormat:
             return "Microphone returned an invalid audio format (sample rate is 0)"
+        case .unsupportedSourceFormat(let label):
+            return "\(label) audio format cannot be converted to 16 kHz mono"
         }
     }
 }

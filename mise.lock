@@ -6,3 +6,4 @@ backend = "core:swift"
 
 [tools.swift."platforms.macos-arm64"]
 checksum = "blake3:7bad641f1ca2109809a817736ec36b73ff9118e288c85cd6e20be270220b4069"
+url = "https://download.swift.org/swift-6.3-release/xcode/swift-6.3-RELEASE/swift-6.3-RELEASE-osx.pkg"

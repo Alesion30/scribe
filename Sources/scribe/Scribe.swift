@@ -56,6 +56,9 @@ extension Scribe {
         @Option(name: .shortAndLong, help: "Language hint (ISO 639-1, e.g. ja, en). 'auto' for detection.")
         var language: String?
 
+        @Option(name: [.customShort("f"), .long], help: "Transcript output format.")
+        var format: TranscriptFormat?
+
         @Flag(name: .long, help: "Disable microphone input (system audio only).")
         var noMic: Bool = false
 
@@ -63,36 +66,36 @@ extension Scribe {
         var noSystem: Bool = false
 
         mutating func run() async throws {
-            let config = try resolveConfig(global: global, model: model, language: language, noMic: noMic, noSystem: noSystem)
+            let config = try resolveConfig(global: global, model: model, language: language, format: format, noMic: noMic, noSystem: noSystem)
 
             // Ensure the model exists before recording so a missing model
             // (or a declined download) doesn't waste a recording session.
             _ = try await ModelManager.ensureModel(config.model)
 
             // Record
-            let (samples, wavFile) = try await performRecording(
+            let recording = try await performRecording(
                 captureMic: !config.noMic,
                 captureSystem: !config.noSystem,
                 wavPath: wavPath,
                 config: config
             )
 
-            guard !samples.isEmpty else {
+            guard !recording.samples.isEmpty else {
                 throw ScribeError.noAudioCaptured
             }
 
-            // Transcribe
-            let text = try await performTranscription(
-                samples: samples,
+            // Transcribe, streaming segments to the output as they are decoded.
+            let writer = try TranscriptWriter(path: output, format: config.format)
+            defer { writer.close() }
+
+                samples: recording.samples,
                 modelName: config.model,
-                language: config.language
+                language: config.language,
+                onSegment: writer.write
             )
 
-            // Output
-            try writeOutput(text, to: output)
-
-            if let wav = wavFile {
-                Log.status("Recording saved to: \(wav)")
+            if let wav = recording.wavPath {
+                Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
             }
         }
     }
@@ -120,15 +123,15 @@ extension Scribe {
         mutating func run() async throws {
             let config = try resolveConfig(global: global, noMic: noMic, noSystem: noSystem)
 
-            let (_, wavFile) = try await performRecording(
+            let recording = try await performRecording(
                 captureMic: !config.noMic,
                 captureSystem: !config.noSystem,
                 wavPath: output,
                 config: config
             )
 
-            if let wav = wavFile {
-                Log.status("Recording saved to: \(wav)")
+            if let wav = recording.wavPath {
+                Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
             }
         }
     }
@@ -156,8 +159,27 @@ extension Scribe {
         @Option(name: .shortAndLong, help: "Language hint (ISO 639-1, e.g. ja, en). 'auto' for detection.")
         var language: String?
 
+        @Option(name: .long, help: "Start offset in seconds.")
+        var start: Double = 0
+
+        @Option(name: .long, help: "Length in seconds to transcribe (default: to end of file).")
+        var duration: Double?
+
+        @Option(name: [.customShort("f"), .long], help: "Transcript output format.")
+        var format: TranscriptFormat?
+
         mutating func run() async throws {
-            let config = try resolveConfig(global: global, model: model, language: language)
+            let config = try resolveConfig(global: global, model: model, language: language, format: format)
+
+            // Reject a bad range up front so a long WAV isn't decoded for nothing.
+            guard start.isFinite, start >= 0 else {
+                throw ScribeError.invalidTimeRange("--start must be zero or greater")
+            }
+            if let duration {
+                guard duration.isFinite, duration > 0 else {
+                    throw ScribeError.invalidTimeRange("--duration must be greater than zero")
+                }
+            }
 
             let path = (input as NSString).expandingTildeInPath
             guard FileManager.default.fileExists(atPath: path) else {
@@ -165,16 +187,32 @@ extension Scribe {
             }
 
             Log.status("Reading \(path)...")
-            let samples = try AudioWriter.readWAV(from: path)
-            Log.info("Read \(samples.count) samples (\(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s)")
+            var samples = try AudioWriter.readWAV(from: path)
+            let totalSeconds = Double(samples.count) / AudioWriter.sampleRate
+            Log.info("Read \(samples.count) samples (\(String(format: "%.1f", totalSeconds))s)")
 
-            let text = try await performTranscription(
+            if start > 0 || duration != nil {
+                // Slicing past the end yields an empty transcript, which looks like a broken file.
+                guard start < totalSeconds else {
+                    throw ScribeError.invalidTimeRange(
+                        "--start \(String(format: "%.1f", start))s is past the end of the \(String(format: "%.1f", totalSeconds))s audio"
+                    )
+                }
+
+                samples = AudioWriter.slice(samples, startSeconds: start, durationSeconds: duration)
+                let end = start + Double(samples.count) / AudioWriter.sampleRate
+                Log.status("Range: \(String(format: "%.1f", start))s - \(String(format: "%.1f", end))s")
+            }
+
+            let writer = try TranscriptWriter(path: output, format: config.format)
+            defer { writer.close() }
+
+            try await performTranscription(
                 samples: samples,
                 modelName: config.model,
-                language: config.language
+                language: config.language,
+                onSegment: writer.write
             )
-
-            try writeOutput(text, to: output)
         }
     }
 }
@@ -281,6 +319,7 @@ extension Scribe.Model {
 private struct ResolvedConfig {
     let model: String
     let language: String
+    let format: TranscriptFormat
     let noMic: Bool
     let noSystem: Bool
     let recordingsDir: String
@@ -291,6 +330,7 @@ private func resolveConfig(
     global: GlobalOptions,
     model: String? = nil,
     language: String? = nil,
+    format: TranscriptFormat? = nil,
     noMic: Bool = false,
     noSystem: Bool = false
 ) throws -> ResolvedConfig {
@@ -302,6 +342,7 @@ private func resolveConfig(
     let resolved = ResolvedConfig(
         model: model ?? fileConfig.resolvedModel,
         language: language ?? fileConfig.resolvedLanguage,
+        format: format ?? fileConfig.resolvedFormat,
         noMic: noMic || fileConfig.resolvedNoMic,
         noSystem: noSystem || fileConfig.resolvedNoSystem,
         recordingsDir: fileConfig.resolvedRecordingsDir
@@ -310,6 +351,7 @@ private func resolveConfig(
     Log.status("Config:")
     Log.status("  model        = \(resolved.model)\(model != nil ? " (CLI)" : fileConfig.model != nil ? " (config)" : " (default)")")
     Log.status("  language     = \(resolved.language)\(language != nil ? " (CLI)" : fileConfig.language != nil ? " (config)" : " (default)")")
+    Log.status("  format       = \(resolved.format.rawValue)\(format != nil ? " (CLI)" : fileConfig.format != nil ? " (config)" : " (default)")")
     Log.status("  noMic        = \(resolved.noMic)\(noMic ? " (CLI)" : fileConfig.noMic == true ? " (config)" : " (default)")")
     Log.status("  noSystem     = \(resolved.noSystem)\(noSystem ? " (CLI)" : fileConfig.noSystem == true ? " (config)" : " (default)")")
     Log.status("  recordingsDir = \(resolved.recordingsDir)\(fileConfig.recordingDir != nil ? " (config)" : " (default)")")
@@ -321,15 +363,58 @@ private func setupVerbose(_ global: GlobalOptions) {
     Log.verbose = global.verbose
 }
 
-/// Record audio, save WAV, return (samples, wavPath).
+/// A finished recording session and the wall-clock span it covered.
+private struct RecordingResult {
+    let samples: [Float]
+    /// nil when nothing was captured and no file was written.
+    let wavPath: String?
+    let startedAt: Date
+    let endedAt: Date
+
+    /// Span for the "saved to" line, e.g. "10:01:33 → 12:09:21, 2h 7m 48s".
+    var spanDescription: String {
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm:ss"
+        let elapsed = max(0, Int(endedAt.timeIntervalSince(startedAt).rounded()))
+        return "\(clock.string(from: startedAt)) → \(clock.string(from: endedAt)), \(formatDuration(elapsed))"
+    }
+}
+
+/// Build the default WAV path, named for when the recording started.
+func defaultWavPath(startedAt: Date, in directory: String) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+    return (directory as NSString).appendingPathComponent("\(formatter.string(from: startedAt)).wav")
+}
+
+/// Render a duration as "2h 7m 48s", dropping units that would lead with zero.
+func formatDuration(_ seconds: Int) -> String {
+    let hours = seconds / 3600
+    let minutes = (seconds % 3600) / 60
+    let remainder = seconds % 60
+
+    if hours > 0 { return "\(hours)h \(minutes)m \(remainder)s" }
+    if minutes > 0 { return "\(minutes)m \(remainder)s" }
+    return "\(remainder)s"
+}
+
+/// Record audio, save WAV, return the session result.
 private func performRecording(
     captureMic: Bool,
     captureSystem: Bool,
     wavPath: String?,
     config: ResolvedConfig
-) async throws -> ([Float], String?) {
-    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem)
+) async throws -> RecordingResult {
+    // Stamp the start before creating source files so every file names the session start.
+    let startedAt = Date()
+    let output = wavPath.map { ($0 as NSString).expandingTildeInPath }
+        ?? defaultWavPath(startedAt: startedAt, in: config.recordingsDir)
+    let paths = RecordingPaths(output: output)
+    try paths.prepareDirectory()
 
+    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem, paths: paths)
+
+    Log.status("Recording to: \(paths.output)")
     Log.status("Recording... Press Ctrl+C to stop.")
 
     // Set up SIGINT handler for graceful stop
@@ -345,6 +430,7 @@ private func performRecording(
         }
     }
 
+
     // Start capture in background
     let captureTask = Task {
         try await capture.startCapture()
@@ -353,65 +439,53 @@ private func performRecording(
     // Wait for SIGINT
     await stopTask.value
 
-    // Stop capture and get samples
+    // Stop capture and close the per-source recordings
     Log.status("") // newline after ^C
-    let samples = capture.stopCapture()
+    let result = capture.stopCapture()
+    let endedAt = Date()
     sigintSource.cancel()
     signal(SIGINT, SIG_DFL)
 
     // Cancel capture task
     captureTask.cancel()
 
-    // Save WAV
-    let resolvedWavPath: String
-    if let explicit = wavPath {
-        resolvedWavPath = (explicit as NSString).expandingTildeInPath
-    } else {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let timestamp = formatter.string(from: Date())
-        resolvedWavPath = (config.recordingsDir as NSString).appendingPathComponent("\(timestamp).wav")
+    do {
+        let samples = try RecordingFinalizer.finalize(result, to: paths.output)
+        return RecordingResult(
+            samples: samples,
+            wavPath: samples.isEmpty ? nil : paths.output,
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+    } catch {
+        Log.error("Failed to write \(paths.output): \(error.localizedDescription)")
+        for source in result.sources {
+            Log.status("  Source recording kept: \(source.path)")
+        }
+        throw error
     }
-
-    if !samples.isEmpty {
-        try AudioWriter.writeWAV(samples: samples, to: resolvedWavPath)
-        return (samples, resolvedWavPath)
-    }
-
-    return ([], nil)
 }
 
-/// Transcribe audio samples using whisper.cpp.
+/// Transcribe audio samples using whisper.cpp and forward each decoded segment immediately.
 /// Downloads the model first if it is a known model that hasn't been fetched yet.
 private func performTranscription(
     samples: [Float],
     modelName: String,
-    language: String
-) async throws -> String {
+    language: String,
+    onSegment: @escaping (TranscriptSegment) -> Void
+) async throws -> [TranscriptSegment] {
     let modelPath = try await ModelManager.ensureModel(modelName)
 
     Log.status("Loading model: \(modelName)")
     let whisper = try WhisperContext(modelPath: modelPath)
 
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
-    let text = try whisper.transcribe(samples: samples, language: language)
-
-    if Log.verbose {
-        FileHandle.standardError.write(Data("\n".utf8))
-    }
-
-    return text
-}
-
-/// Write text to file or stdout.
-private func writeOutput(_ text: String, to path: String) throws {
-    if path == "-" {
-        print(text)
-    } else {
-        let expandedPath = (path as NSString).expandingTildeInPath
-        try text.write(toFile: expandedPath, atomically: true, encoding: .utf8)
-        Log.status("Transcript written to: \(expandedPath)")
-    }
+    return try whisper.transcribe(
+        samples: samples,
+        language: language,
+        showProgress: Log.verbose,
+        onSegment: onSegment
+    )
 }
 
 // MARK: - Errors
@@ -421,6 +495,8 @@ enum ScribeError: LocalizedError {
     case fileNotFound(String)
     case unknownModel(String)
     case invalidURL(String)
+    case cannotWriteOutput(String)
+    case invalidTimeRange(String)
 
     var errorDescription: String? {
         switch self {
@@ -436,6 +512,10 @@ enum ScribeError: LocalizedError {
                 """
         case .invalidURL(let url):
             return "Invalid URL: \(url)"
+        case .cannotWriteOutput(let path):
+            return "Cannot write transcript to: \(path)"
+        case .invalidTimeRange(let reason):
+            return "Invalid time range: \(reason)"
         }
     }
 }
