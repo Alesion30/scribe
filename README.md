@@ -8,6 +8,7 @@ A macOS command-line tool that captures audio from the microphone and/or system 
 - **Local transcription** — Runs whisper.cpp on-device with Metal GPU acceleration
 - **Streaming output** — Transcript segments are written out as they are decoded, so long files show progress and an interrupted run keeps what it got
 - **Flexible workflow** — Record and transcribe in one step, or use them separately
+- **Partial transcription** — Transcribe a time range of a file without cutting it first
 - **Language detection** — Automatic language detection or manual hint (ISO 639-1)
 - **Timestamped output** — Emit plain text, SRT, or WebVTT subtitles with per-segment timestamps
 - **Model management** — Download, list, and remove whisper models from the CLI
@@ -106,6 +107,12 @@ scribe transcribe recording.wav
 
 # Specify model and language
 scribe transcribe recording.wav -m large-v3-turbo -l ja
+
+# Transcribe only part of the file: 180 seconds starting at 10:00
+scribe transcribe recording.wav --start 600 --duration 180
+
+# From 10:00 to the end of the file
+scribe transcribe recording.wav --start 600
 
 # Emit WebVTT instead of plain text
 scribe transcribe recording.wav -f vtt

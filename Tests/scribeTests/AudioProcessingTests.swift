@@ -219,6 +219,52 @@ struct AudioProcessingTests {
         #expect(peakValue <= 1.0, "Mixed output peak (\(peakValue)) should be <= 1.0")
     }
 
+    // MARK: - Slice Tests
+
+    @Test("Slice without a range returns the whole input")
+    func sliceWithoutRange() {
+        let audio = Self.sineWave(frequency: 440, amplitude: 0.5, durationSeconds: 3.0)
+        let result = AudioWriter.slice(audio, startSeconds: 0)
+        #expect(result == audio)
+    }
+
+    @Test("Slice drops samples before the start offset")
+    func sliceDropsLeadingSamples() {
+        let audio = Self.sineWave(frequency: 440, amplitude: 0.5, durationSeconds: 3.0)
+        let result = AudioWriter.slice(audio, startSeconds: 1.0)
+        #expect(result.count == audio.count - 16000)
+        #expect(result.first == audio[16000])
+    }
+
+    @Test("Slice honors start and duration")
+    func sliceHonorsStartAndDuration() {
+        let audio = Self.sineWave(frequency: 440, amplitude: 0.5, durationSeconds: 10.0)
+        let result = AudioWriter.slice(audio, startSeconds: 2.5, durationSeconds: 1.5)
+        #expect(result.count == 24000)
+        #expect(result == Array(audio[40000..<64000]))
+    }
+
+    @Test("Slice clamps a duration running past the end")
+    func sliceClampsOverlongDuration() {
+        let audio = Self.sineWave(frequency: 440, amplitude: 0.5, durationSeconds: 3.0)
+        let result = AudioWriter.slice(audio, startSeconds: 2.0, durationSeconds: 60.0)
+        #expect(result.count == 16000)
+        #expect(result == Array(audio[32000...]))
+    }
+
+    @Test("Slice returns empty when the start offset is past the end")
+    func sliceStartPastEnd() {
+        let audio = Self.sineWave(frequency: 440, amplitude: 0.5, durationSeconds: 1.0)
+        let result = AudioWriter.slice(audio, startSeconds: 5.0, durationSeconds: 1.0)
+        #expect(result.isEmpty)
+    }
+
+    @Test("Slice handles empty input")
+    func sliceHandlesEmpty() {
+        let result = AudioWriter.slice([], startSeconds: 1.0, durationSeconds: 1.0)
+        #expect(result.isEmpty)
+    }
+
     // MARK: - Before/After Comparison
 
     @Test("Quantitative comparison: fix vs no-fix for offline meeting")
