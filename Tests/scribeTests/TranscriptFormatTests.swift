@@ -108,4 +108,27 @@ struct TranscriptFormatTests {
 
         #expect(output == (format == .vtt ? "WEBVTT" : ""))
     }
+
+    // MARK: - Shifting
+
+    @Test("shifted は開始と終了に同じオフセットを足す")
+    func shiftMovesBothEnds() {
+        let shifted = TranscriptSegment(start: 1.5, end: 4.25, text: "区間").shifted(by: 600)
+
+        #expect(shifted == TranscriptSegment(start: 601.5, end: 604.25, text: "区間"))
+    }
+
+    @Test("オフセット 0 ではセグメントが変わらない")
+    func shiftByZeroIsIdentity() {
+        let segment = TranscriptSegment(start: 1.5, end: 4.25, text: "区間")
+
+        #expect(segment.shifted(by: 0) == segment)
+    }
+
+    @Test("--start で切り出しても元ファイル基準のタイムコードになる")
+    func shiftedSegmentsRenderOnSourceClock() {
+        let sliced = Self.sample.map { $0.shifted(by: 600) }
+
+        #expect(TranscriptFormat.srt.render(sliced).contains("00:10:00,000 --> 00:10:03,480"))
+    }
 }

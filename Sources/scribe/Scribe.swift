@@ -106,6 +106,7 @@ extension Scribe {
             try await performTranscription(
                 samples: recording.samples,
                 config: config,
+                showProgress: !writer.isStdout,
                 onSegment: writer.write
             )
 
@@ -235,10 +236,13 @@ extension Scribe {
             let writer = try TranscriptWriter(path: output, format: config.format)
             defer { writer.close() }
 
+            // Timestamps stay on the source file's clock, so subtitles from a slice still line up.
+            let offset = start
             try await performTranscription(
                 samples: samples,
                 config: config,
-                onSegment: writer.write
+                showProgress: !writer.isStdout,
+                onSegment: { writer.write(segment: $0.shifted(by: offset)) }
             )
         }
     }
@@ -454,35 +458,45 @@ private func performRecording(
     let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem, paths: paths)
 
     Log.status("Recording to: \(paths.output)")
-    Log.status("Recording... Press Ctrl+C to stop.")
+
+    let stopSignal = StopSignal()
 
     // Set up SIGINT handler for graceful stop
     let sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
     signal(SIGINT, SIG_IGN) // Ignore default SIGINT handling
-
-    let stopTask = Task {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            sigintSource.setEventHandler {
-                cont.resume()
-            }
-            sigintSource.resume()
-        }
-    }
+    sigintSource.setEventHandler { stopSignal.signal(.interrupted) }
+    sigintSource.resume()
 
     // Start capture in background
     let captureTask = Task {
-        try await capture.startCapture()
+        do {
+            try await capture.startCapture {
+                Log.status("Recording... Press Ctrl+C to stop.")
+            }
+        } catch {
+            // startCapture only throws while setting up, so this never races a real recording.
+            stopSignal.signal(.failed(error))
+        }
     }
 
-    // Wait for SIGINT
-    await stopTask.value
+    // Wait for SIGINT, or for capture to give up before it ever started
+    let reason = await stopSignal.wait()
+
+    sigintSource.cancel()
+    signal(SIGINT, SIG_DFL)
+
+    if case .failed(let error) = reason {
+        captureTask.cancel()
+        for source in capture.stopCapture().sources {
+            Log.status("  Source recording kept: \(source.path)")
+        }
+        throw error
+    }
 
     // Stop capture and close the per-source recordings
     Log.status("") // newline after ^C
     let result = capture.stopCapture()
     let endedAt = Date()
-    sigintSource.cancel()
-    signal(SIGINT, SIG_DFL)
 
     // Cancel capture task
     captureTask.cancel()
@@ -510,6 +524,7 @@ private func performRecording(
 private func performTranscription(
     samples: [Float],
     config: ResolvedConfig,
+    showProgress: Bool,
     onSegment: @escaping (TranscriptSegment) -> Void
 ) async throws -> [TranscriptSegment] {
     let modelPath = try await ModelManager.ensureModel(config.model)
@@ -523,12 +538,19 @@ private func performTranscription(
     let whisper = try WhisperContext(modelPath: modelPath)
 
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
-    return try whisper.transcribe(
+    let segments = try whisper.transcribe(
         samples: samples,
         options: options,
-        showProgress: Log.verbose,
+        showProgress: showProgress,
         onSegment: onSegment
     )
+
+    // The progress line is rewritten with \r, so close it before anything else writes to stderr.
+    if showProgress {
+        eprintln("")
+    }
+
+    return segments
 }
 
 // MARK: - Errors

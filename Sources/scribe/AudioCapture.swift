@@ -17,6 +17,9 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     let captureMic: Bool
     let captureSystem: Bool
 
+    /// How long to wait for ScreenCaptureKit to answer before treating it as a missing permission.
+    static let shareableContentTimeout: Duration = .seconds(10)
+
     private let paths: RecordingPaths
 
     // ScreenCaptureKit — system audio only
@@ -41,7 +44,10 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     // MARK: - Public API
 
     /// Start capturing audio. Suspends until stopCapture() is called.
-    func startCapture() async throws {
+    ///
+    /// - Parameter onStarted: called once every requested source is live, so the caller
+    ///   only claims to be recording after setup actually succeeded.
+    func startCapture(onStarted: () -> Void = {}) async throws {
         Log.info("Starting audio capture (mic: \(captureMic), system: \(captureSystem))")
 
         if captureMic {
@@ -51,6 +57,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         if captureSystem {
             try await startSystemAudioCapture()
         }
+
+        onStarted()
 
         // Suspend until stopCapture() resumes the continuation
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
@@ -167,7 +175,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     private func startSystemAudioCapture() async throws {
         let content: SCShareableContent
         do {
-            content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            content = try await Self.shareableContent(timeout: Self.shareableContentTimeout)
         } catch {
             handlePermissionError(error)
             throw error
@@ -260,7 +268,32 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
     // MARK: - Private
 
+    /// Ask ScreenCaptureKit what is shareable, giving up after `timeout`.
+    ///
+    /// Without the grant the call can hang forever instead of throwing, which used to leave
+    /// scribe waiting for a Ctrl+C while capturing nothing.
+    private static func shareableContent(timeout: Duration) async throws -> SCShareableContent {
+        try await withThrowingTaskGroup(of: SCShareableContent.self) { group in
+            group.addTask {
+                try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                throw AudioCaptureError.screenRecordingUnavailable
+            }
+
+            guard let content = try await group.next() else {
+                throw AudioCaptureError.screenRecordingUnavailable
+            }
+            group.cancelAll()
+            return content
+        }
+    }
+
     private func handlePermissionError(_ error: any Error) {
+        // Our own errors already spell out the fix; this is for ScreenCaptureKit's opaque ones.
+        guard !(error is AudioCaptureError) else { return }
+
         let nsError = error as NSError
         // SCStream permission errors are typically in the SCStreamError domain
         if nsError.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain" ||
@@ -414,15 +447,31 @@ enum AudioCaptureError: LocalizedError {
     case noDisplayFound
     case invalidMicrophoneFormat
     case unsupportedSourceFormat(String)
+    case screenRecordingUnavailable
+
+    /// A missing grant surfaces as either no display or no answer, so both point at the same fix.
+    private static let screenRecordingHelp = """
+        Open System Settings > Privacy & Security > Screen & System Audio Recording and enable access \
+        for your terminal application (e.g., Terminal, iTerm2).
+        To record without system audio, pass --no-system.
+        """
 
     var errorDescription: String? {
         switch self {
         case .noDisplayFound:
-            return "No display found for audio capture"
+            return """
+                ScreenCaptureKit reported no display, which usually means screen recording permission is missing.
+                \(Self.screenRecordingHelp)
+                """
         case .invalidMicrophoneFormat:
             return "Microphone returned an invalid audio format (sample rate is 0)"
         case .unsupportedSourceFormat(let label):
             return "\(label) audio format cannot be converted to 16 kHz mono"
+        case .screenRecordingUnavailable:
+            return """
+                ScreenCaptureKit did not respond, which usually means screen recording permission is missing.
+                \(Self.screenRecordingHelp)
+                """
         }
     }
 }

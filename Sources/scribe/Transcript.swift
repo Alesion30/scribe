@@ -7,6 +7,12 @@ struct TranscriptSegment: Equatable {
     let start: TimeInterval
     let end: TimeInterval
     let text: String
+
+    /// Move the segment onto another clock, e.g. back onto the source file after a --start slice.
+    func shifted(by seconds: TimeInterval) -> TranscriptSegment {
+        guard seconds != 0 else { return self }
+        return TranscriptSegment(start: start + seconds, end: end + seconds, text: text)
+    }
 }
 
 /// Output format for a transcript.
