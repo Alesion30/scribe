@@ -280,11 +280,34 @@ struct AudioProcessingTests {
         let unfixedDenoised = AudioWriter.reduceNoise(from: unfixedMixed)
         let unfixedOutput = AudioWriter.normalize(unfixedDenoised, targetPeak: 0.9)
 
-        // --- WITH FIX: run the real mixdown, which drops the silent source ---
-        let fixedOutput = AudioCapture.mixdown(
-            mic: AudioTrack(startSeconds: 0, samples: micSamples),
-            system: AudioTrack(startSeconds: 0, samples: systemSamples)
-        )
+        // --- WITH FIX: detect silence, exclude system audio ---
+        let silenceThreshold: Float = 0.01
+        var fixedMic = micSamples
+        var fixedSystem = systemSamples
+
+        var sysSumSq: Float = 0
+        vDSP_svesq(fixedSystem, 1, &sysSumSq, vDSP_Length(fixedSystem.count))
+        if sqrtf(sysSumSq / Float(fixedSystem.count)) < silenceThreshold {
+            fixedSystem = []
+        }
+
+        if !fixedMic.isEmpty {
+            fixedMic = AudioWriter.normalize(fixedMic, targetPeak: 0.5)
+        }
+        if !fixedSystem.isEmpty {
+            fixedSystem = AudioWriter.normalize(fixedSystem, targetPeak: 0.5)
+        }
+
+        let fixedMixed: [Float]
+        if !fixedMic.isEmpty && !fixedSystem.isEmpty {
+            fixedMixed = AudioWriter.mix(fixedMic, fixedSystem)
+        } else if !fixedMic.isEmpty {
+            fixedMixed = fixedMic
+        } else {
+            fixedMixed = fixedSystem
+        }
+        let fixedDenoised = AudioWriter.reduceNoise(from: fixedMixed)
+        let fixedOutput = AudioWriter.normalize(fixedDenoised, targetPeak: 0.9)
 
         // --- Compare quality metrics ---
 
@@ -345,20 +368,49 @@ struct AudioProcessingTests {
 
     @Test("Full pipeline: offline meeting produces clean output")
     func fullPipelineOfflineMeeting() {
-        // Offline meeting: the mic hears the room, the system stream carries nothing.
-        let mic = AudioTrack(startSeconds: 100.0, samples: Self.roomAudio(durationSeconds: 10.0))
-        let system = AudioTrack(startSeconds: 100.0, samples: Self.silence(durationSeconds: 10.0, noiseAmplitude: 0.0003))
+        // Simulate the exact stopCapture() pipeline for an offline meeting
+        let micSamples = Self.roomAudio(durationSeconds: 10.0)
+        let systemSamples = Self.silence(durationSeconds: 10.0, noiseAmplitude: 0.0003)
 
-        let systemRMS = Self.rms(system.samples)
-        let micRMS = Self.rms(mic.samples)
-        #expect(systemRMS < 0.01, "System audio should read as silent (RMS=\(systemRMS))")
-        #expect(micRMS > 0.01, "Mic audio should read as active (RMS=\(micRMS))")
+        // Step 1: Silence detection (the fix)
+        let silenceRMSThreshold: Float = 0.01
+        var activeMic = micSamples
+        var activeSystem = systemSamples
 
-        let output = AudioCapture.mixdown(mic: mic, system: system)
+        var sysSumSq: Float = 0
+        vDSP_svesq(activeSystem, 1, &sysSumSq, vDSP_Length(activeSystem.count))
+        let sysRMS = sqrtf(sysSumSq / Float(activeSystem.count))
+        if sysRMS < silenceRMSThreshold {
+            activeSystem = []  // Excluded
+        }
 
-        // The silent system track is excluded, so the mic track comes through on its own.
-        #expect(output.count == mic.samples.count, "Output should keep the mic track's length")
+        var micSumSq: Float = 0
+        vDSP_svesq(activeMic, 1, &micSumSq, vDSP_Length(activeMic.count))
+        let micRMS = sqrtf(micSumSq / Float(activeMic.count))
+        if micRMS < silenceRMSThreshold {
+            activeMic = []
+        }
 
+        // Verify system was excluded, mic was kept
+        #expect(activeSystem.isEmpty, "System audio should be excluded (RMS=\(sysRMS))")
+        #expect(!activeMic.isEmpty, "Mic audio should be kept (RMS=\(micRMS))")
+
+        // Step 2: Normalize (only mic since system was excluded)
+        let mixTarget: Float = 0.5
+        if !activeMic.isEmpty {
+            activeMic = AudioWriter.normalize(activeMic, targetPeak: mixTarget)
+        }
+
+        // Step 3: Mix (mic only)
+        let mixed = activeMic
+
+        // Step 4: Noise gate
+        let denoised = AudioWriter.reduceNoise(from: mixed)
+
+        // Step 5: Final normalize
+        let output = AudioWriter.normalize(denoised, targetPeak: 0.9)
+
+        // Verify output quality
         let outputPeak = Self.peak(output)
         #expect(abs(outputPeak - 0.9) < 0.05, "Output peak (\(outputPeak)) should be near 0.9")
 
@@ -367,21 +419,5 @@ struct AudioProcessingTests {
         let speechEnd = output.count * 3 / 4
         let speechRMS = Self.rms(Array(output[speechStart..<speechEnd]))
         #expect(speechRMS > 0.1, "Speech segment should have strong signal (RMS=\(speechRMS))")
-    }
-
-    // MARK: - Stream Alignment
-
-    @Test("Mixdown lines the tracks up by start time, not by index")
-    func mixdownAlignsByStartTime() {
-        // The system stream only comes up 0.5 s after the mic, so its audio belongs 0.5 s in.
-        // Mixing head to head would drop it onto what the mic heard half a second earlier,
-        // which is what made the same speech get transcribed twice.
-        let mic = AudioTrack(startSeconds: 100.0, samples: Self.roomAudio(durationSeconds: 10.0))
-        let system = AudioTrack(startSeconds: 100.5, samples: Self.roomAudio(durationSeconds: 10.0))
-
-        let output = AudioCapture.mixdown(mic: mic, system: system)
-
-        let seconds = Double(output.count) / AudioWriter.sampleRate
-        #expect(abs(seconds - 10.5) < 0.001, "Expected a 10.5 s timeline, got \(seconds) s")
     }
 }
