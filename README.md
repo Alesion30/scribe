@@ -292,12 +292,14 @@ SCRIBE_TEST_MODEL=base swift test
 
 ### CI
 
-`.github/workflows/quality.yml` builds and tests the package on a GitHub-hosted `macos-15` runner for every pull request and every push to `main`:
+`.github/workflows/quality.yml` builds and tests the package for every pull request and every push to `main`, on a GitHub-hosted `macos-15` runner pinned to Xcode 26.3 via `DEVELOPER_DIR`:
 
 ```bash
 swift build -c debug
 swift test
 ```
+
+The pin matters because the runner otherwise defaults to Xcode 16.4, which accepts code that the newer toolchain rejects. `release.yml` builds with the same version so a green PR cannot fail at release time.
 
 The runner has no whisper model installed, so `TranscriptionIntegrationTests` is skipped there and CI covers the unit suites only. Real transcription stays a local check — run `./scripts/smoke.sh` below, or set `SCRIBE_TEST_MODEL` as shown above to run the integration suite against a model you already have.
 
