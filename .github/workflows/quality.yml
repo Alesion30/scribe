@@ -12,16 +12,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# The runner defaults to Xcode 16.4, which accepts code that Swift 6.3 on our machines rejects.
-env:
-  DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
-
 jobs:
   build-test:
     name: Swift build and test
     runs-on: macos-15
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+
+      # mise.lock pins the toolchain by checksum, so CI builds with the same Swift as a local checkout.
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
 
       # The whisper xcframework unpacks to ~160 MB, so a cold fetch makes every run hostage to the download.
       - name: Cache SwiftPM artifacts
@@ -33,11 +32,12 @@ jobs:
           key: swiftpm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
           restore-keys: swiftpm-${{ runner.os }}-
 
+      # There is no mise task for a debug build; release builds are what mise run build is for.
       - name: Build (Debug)
-        run: swift build -c debug
+        run: mise exec -- swift build -c debug
 
       - name: Test
-        run: swift test
+        run: mise run test
 
   lint:
     name: SwiftLint
@@ -45,8 +45,7 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
 
-      # SwiftLint ships with the runner; print the version so an image bump adding rules is easy to spot.
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+
       - name: Lint
-        run: |
-          swiftlint version
-          swiftlint lint --strict
+        run: mise run lint

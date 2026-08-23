@@ -317,23 +317,22 @@ SCRIBE_TEST_MODEL=base mise run test
 SwiftLint の設定は `.swiftlint.yml` にある。現状は違反ゼロなので、何か報告されたらそれは変更が持ち込んだもの。
 
 ```bash
-brew install swiftlint   # 初回のみ
-swiftlint lint --strict  # CI と同じ。警告も失敗扱いになる
-swiftlint --fix          # 自動修正できるルールを適用する
+mise run lint                  # swiftlint lint --strict。警告も失敗扱いになる
+mise exec -- swiftlint --fix   # 自動修正できるルールを適用する
 ```
 
 長さと命名のしきい値は既定より緩めてある。信号処理のコードでは短いループ添字や長めの関数のほうが読みやすく、既定に合わせるとコードのほうが歪むため。
 
 ### CI
 
-`.github/workflows/quality.yml` が、PR と `main` への push のたびに GitHub ホストの `macos-15` runner で動く。Xcode は `DEVELOPER_DIR` で 26.3 に固定している。
+`.github/workflows/quality.yml` が、PR と `main` への push のたびに GitHub ホストの `macos-15` runner で動く。
 
 | ジョブ | 実行内容 |
 |---|---|
-| Swift build and test | `swift build -c debug` のあと `swift test` |
-| SwiftLint | `swiftlint lint --strict` |
+| Swift build and test | `swift build -c debug` のあと `mise run test`（どちらも mise の Swift 6.3） |
+| SwiftLint | `mise run lint` |
 
-固定しているのは、runner の既定が Xcode 16.4 で、新しいツールチェーンが弾くコードをそのまま通してしまうため。`release.yml` も同じバージョンでビルドするので、PR が緑なのにリリースだけ落ちることはない。
+ツールチェーンは runner 同梱の Xcode ではなく `mise.toml` のものを使う。`mise.lock` が checksum まで固定しているので、手元と CI が同じ Swift・同じ SwiftLint でビルドされる。`release.yml` も同じ mise の toolchain を使うので、PR が緑なのにリリースだけ落ちることはない。
 
 runner には whisper モデルがないので `TranscriptionIntegrationTests` はスキップされ、CI ではユニットテストだけが走る。実際の文字起こしはローカルでの確認に任せる。下記のスモークテストを実行するか、`SCRIBE_TEST_MODEL` を指定して手元のモデルで結合テストを回す。
 
