@@ -9,6 +9,7 @@ A macOS command-line tool that captures audio from the microphone and/or system 
 - **Flexible workflow** — Record and transcribe in one step, or use them separately
 - **Partial transcription** — Transcribe a time range of a file without cutting it first
 - **Language detection** — Automatic language detection or manual hint (ISO 639-1)
+- **Timestamped output** — Emit plain text, SRT, or WebVTT subtitles with per-segment timestamps
 - **Model management** — Download, list, and remove whisper models from the CLI
 
 ## Requirements
@@ -79,6 +80,9 @@ scribe -w recording.wav
 
 # Write transcript to a file instead of stdout
 scribe -o transcript.txt
+
+# Emit SRT subtitles instead of plain text
+scribe -f srt -o transcript.srt
 ```
 
 ### Record Only
@@ -108,6 +112,32 @@ scribe transcribe recording.wav --start 600 --duration 180
 
 # From 10:00 to the end of the file
 scribe transcribe recording.wav --start 600
+
+# Emit WebVTT instead of plain text
+scribe transcribe recording.wav -f vtt
+```
+
+### Output Formats
+
+`--format` / `-f` selects how the transcript is rendered (default: `txt`).
+
+| Format | Description |
+|---|---|
+| `txt` | One line per segment, no timestamps |
+| `srt` | SubRip subtitles — numbered cues with `HH:MM:SS,mmm` ranges |
+| `vtt` | WebVTT subtitles — a `WEBVTT` header with `HH:MM:SS.mmm` ranges |
+
+Timestamps are elapsed time from the start of the audio.
+
+```
+$ scribe transcribe meeting.wav -l ja -f srt
+1
+00:00:00,000 --> 00:00:03,320
+次の会議は明日の午後3時から始まります。
+
+2
+00:00:03,320 --> 00:00:07,800
+今日はとても良い天気ですね。
 ```
 
 ### Manage Models
@@ -150,6 +180,7 @@ Create `~/.scribe/config.json` to set persistent defaults:
 {
   "model": "large-v3-turbo",
   "language": "auto",
+  "format": "txt",
   "recordingDir": "~/.scribe/recordings",
   "noMic": false,
   "noSystem": false
@@ -173,6 +204,14 @@ All fields are optional. A JSON Schema is available at [`schema/config.schema.js
 │   └── base.bin
 └── recordings/        # Saved audio recordings
     └── 2025-01-15_14-30-00.wav
+```
+
+Recording filenames are stamped with the time the recording **started**, so the
+name identifies the session even for long recordings. `scribe` prints the full
+span when it saves the file:
+
+```
+Recording saved to: ~/.scribe/recordings/2025-01-15_14-30-00.wav (14:30:00 → 16:37:48, 2h 7m 48s)
 ```
 
 ## Permissions
