@@ -26,7 +26,7 @@ jobs:
           path: |
             .build/artifacts
             ~/Library/Caches/org.swift.swiftpm
-          key: swiftpm-${{ runner.os }}-${{ hashFiles('Package.swift') }}
+          key: swiftpm-${{ runner.os }}-${{ hashFiles('Package.swift', 'Package.resolved') }}
           restore-keys: swiftpm-${{ runner.os }}-
 
       - name: Build (Debug)
