@@ -117,8 +117,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         )
         self.micRecorder = recorder
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-            self?.handleMicBuffer(buffer)
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, time in
+            self?.handleMicBuffer(buffer, at: time)
         }
 
         engine.prepare()
@@ -137,7 +137,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         Log.info("Microphone capture started (AVAudioEngine)")
     }
 
-    private func handleMicBuffer(_ buffer: AVAudioPCMBuffer) {
+    private func handleMicBuffer(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime) {
         guard let channelData = buffer.floatChannelData else { return }
         let frameCount = Int(buffer.frameLength)
         let channels = Int(buffer.format.channelCount)
@@ -158,7 +158,8 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             samples = interleaved
         }
 
-        micRecorder?.append(samples)
+        let startSeconds = time.isHostTimeValid ? AVAudioTime.seconds(forHostTime: time.hostTime) : nil
+        micRecorder?.append(samples, startingAt: startSeconds)
     }
 
     // MARK: - System Audio (ScreenCaptureKit)
@@ -241,7 +242,11 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             Log.warning("System audio arrived at \(asbd.pointee.mSampleRate) Hz, expected \(sourceSampleRate) Hz")
         }
 
-        systemRecorder?.append(samples)
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let startSeconds = pts.isValid
+            ? AVAudioTime.seconds(forHostTime: CMClockConvertHostTimeToSystemUnits(pts))
+            : nil
+        systemRecorder?.append(samples, startingAt: startSeconds)
     }
 
     // MARK: - SCStreamDelegate
@@ -298,6 +303,9 @@ final class SourceRecorder: @unchecked Sendable {
     private var peak: Float = 0
     private var sumSquares: Double = 0
 
+    private var timeline = CaptureTimeline()
+    private var silenceFilled = 0
+
     private var writeFailure: (any Error)?
     private var lastLoggedSampleCount = 0
 
@@ -315,10 +323,10 @@ final class SourceRecorder: @unchecked Sendable {
         Log.debug("\(label) recording to \(path) (\(sampleRate) Hz, \(channels)ch -> 16 kHz mono)")
     }
 
-    /// Hand off one interleaved buffer. Returns immediately.
-    func append(_ interleaved: [Float]) {
+    /// Hand off one interleaved buffer, stamped with the host-clock instant of its first frame.
+    func append(_ interleaved: [Float], startingAt hostSeconds: Double? = nil) {
         guard !interleaved.isEmpty else { return }
-        queue.async { [self] in process(interleaved) }
+        queue.async { [self] in process(interleaved, startingAt: hostSeconds) }
     }
 
     /// Drain pending writes, close the file, and report what was captured.
@@ -340,11 +348,17 @@ final class SourceRecorder: @unchecked Sendable {
         let duration = Double(count) / AudioWriter.sampleRate
         Log.debug("\(label) captured: \(count) samples (\(String(format: "%.1f", duration))s)")
 
+        if silenceFilled > 0 {
+            let seconds = Double(silenceFilled) / AudioWriter.sampleRate
+            Log.debug("\(label) capture dropped \(String(format: "%.2f", seconds))s, filled with silence")
+        }
+
         return CapturedSource(
             path: path,
             sampleCount: count,
             peak: peak,
-            rms: Float((sumSquares / Double(count)).squareRoot())
+            rms: Float((sumSquares / Double(count)).squareRoot()),
+            startSeconds: timeline.startSeconds
         )
     }
 
@@ -357,8 +371,12 @@ final class SourceRecorder: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func process(_ interleaved: [Float]) {
+    private func process(_ interleaved: [Float], startingAt hostSeconds: Double?) {
         guard writeFailure == nil else { return }
+
+        // Worked out before resampling so the first buffer sets the origin even if its conversion fails.
+        let missing = timeline.silenceNeeded(before: hostSeconds, written: writer.sampleCount)
+
         guard let resampled = resampler.resample(interleaved), !resampled.isEmpty else { return }
 
         var chunkPeak: Float = 0
@@ -370,6 +388,11 @@ final class SourceRecorder: @unchecked Sendable {
         sumSquares += Double(sumSq)
 
         do {
+            // Restore the hole a dropped buffer left, so what follows stays where the clock says it was.
+            if missing > 0 {
+                silenceFilled += missing
+                try writer.append([Float](repeating: 0, count: missing))
+            }
             try writer.append(resampled)
         } catch {
             // Stop writing but keep the file: what already reached disk is still worth having.
