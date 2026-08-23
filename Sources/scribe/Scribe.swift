@@ -159,11 +159,27 @@ extension Scribe {
         @Option(name: .shortAndLong, help: "Language hint (ISO 639-1, e.g. ja, en). 'auto' for detection.")
         var language: String?
 
+        @Option(name: .long, help: "Start offset in seconds.")
+        var start: Double = 0
+
+        @Option(name: .long, help: "Length in seconds to transcribe (default: to end of file).")
+        var duration: Double?
+
         @Option(name: [.customShort("f"), .long], help: "Transcript output format.")
         var format: TranscriptFormat?
 
         mutating func run() async throws {
             let config = try resolveConfig(global: global, model: model, language: language, format: format)
+
+            // Reject a bad range up front so a long WAV isn't decoded for nothing.
+            guard start.isFinite, start >= 0 else {
+                throw ScribeError.invalidTimeRange("--start must be zero or greater")
+            }
+            if let duration {
+                guard duration.isFinite, duration > 0 else {
+                    throw ScribeError.invalidTimeRange("--duration must be greater than zero")
+                }
+            }
 
             let path = (input as NSString).expandingTildeInPath
             guard FileManager.default.fileExists(atPath: path) else {
@@ -171,8 +187,22 @@ extension Scribe {
             }
 
             Log.status("Reading \(path)...")
-            let samples = try AudioWriter.readWAV(from: path)
-            Log.info("Read \(samples.count) samples (\(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s)")
+            var samples = try AudioWriter.readWAV(from: path)
+            let totalSeconds = Double(samples.count) / AudioWriter.sampleRate
+            Log.info("Read \(samples.count) samples (\(String(format: "%.1f", totalSeconds))s)")
+
+            if start > 0 || duration != nil {
+                // Slicing past the end yields an empty transcript, which looks like a broken file.
+                guard start < totalSeconds else {
+                    throw ScribeError.invalidTimeRange(
+                        "--start \(String(format: "%.1f", start))s is past the end of the \(String(format: "%.1f", totalSeconds))s audio"
+                    )
+                }
+
+                samples = AudioWriter.slice(samples, startSeconds: start, durationSeconds: duration)
+                let end = start + Double(samples.count) / AudioWriter.sampleRate
+                Log.status("Range: \(String(format: "%.1f", start))s - \(String(format: "%.1f", end))s")
+            }
 
             let segments = try await performTranscription(
                 samples: samples,
@@ -467,6 +497,7 @@ enum ScribeError: LocalizedError {
     case fileNotFound(String)
     case unknownModel(String)
     case invalidURL(String)
+    case invalidTimeRange(String)
 
     var errorDescription: String? {
         switch self {
@@ -482,6 +513,8 @@ enum ScribeError: LocalizedError {
                 """
         case .invalidURL(let url):
             return "Invalid URL: \(url)"
+        case .invalidTimeRange(let reason):
+            return "Invalid time range: \(reason)"
         }
     }
 }
