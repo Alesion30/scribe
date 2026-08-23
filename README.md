@@ -8,6 +8,7 @@ A macOS command-line tool that captures audio from the microphone and/or system 
 - **Local transcription** — Runs whisper.cpp on-device with Metal GPU acceleration
 - **Flexible workflow** — Record and transcribe in one step, or use them separately
 - **Partial transcription** — Transcribe a time range of a file without cutting it first
+- **Long-recording safe** — Splits long audio and skips silence with VAD, so whisper doesn't loop on a quiet stretch
 - **Language detection** — Automatic language detection or manual hint (ISO 639-1)
 - **Timestamped output** — Emit plain text, SRT, or WebVTT subtitles with per-segment timestamps
 - **Model management** — Download, list, and remove whisper models from the CLI
@@ -115,7 +116,30 @@ scribe transcribe recording.wav --start 600
 
 # Emit WebVTT instead of plain text
 scribe transcribe recording.wav -f vtt
+
+# Feed the audio to whisper as-is, without skipping silence
+scribe transcribe recording.wav --no-vad
 ```
+
+### Long Recordings
+
+whisper normalizes the audio spectrogram against the loudest frame of whatever it is given and
+clamps everything 80 dB below that. Hand it an hour in one piece and a single loud moment flattens
+the rest into the floor, at which point the decoder starts repeating the same line for the remainder
+of the file. Long silences make it worse, because there is nothing to anchor the decoding to.
+
+scribe works around both by default:
+
+| Option | Default | Description |
+|---|---|---|
+| `--chunk-length <seconds>` | `600` | Audio per whisper call, so the normalization stays local. `0` feeds the whole recording at once. |
+| `--vad` / `--no-vad` | enabled | Skip silence using a Silero VAD model. Timestamps still refer to the original audio. |
+
+The VAD model (~865 KB) is downloaded on first use and kept in `~/.scribe/models/`. It is not a
+transcription model, so `scribe model list` leaves it out.
+
+Runs of identical consecutive lines are collapsed to their first occurrence, so a loop that survives
+both measures still doesn't bury the rest of the transcript.
 
 ### Output Formats
 
@@ -182,6 +206,8 @@ Create `~/.scribe/config.json` to set persistent defaults:
   "language": "auto",
   "format": "txt",
   "recordingDir": "~/.scribe/recordings",
+  "vad": true,
+  "chunkLength": 600,
   "noMic": false,
   "noSystem": false
 }
@@ -201,7 +227,8 @@ All fields are optional. A JSON Schema is available at [`schema/config.schema.js
 ~/.scribe/
 ├── config.json        # Configuration file (optional)
 ├── models/            # Downloaded whisper models
-│   └── base.bin
+│   ├── base.bin
+│   └── silero-v5.1.2.bin   # VAD model, fetched on first use
 └── recordings/        # Saved audio recordings
     └── 2025-01-15_14-30-00.wav
 ```
@@ -237,6 +264,8 @@ Grant access to your terminal application (Terminal, iTerm2, etc.).
 | `large-v3` | ~2.9 GB | Most accurate |
 
 These standard models can be downloaded by name alone (`scribe model download <name>`); they are hosted on [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp/tree/main) as `ggml-*.bin` files.
+
+Silence skipping additionally uses `silero-v5.1.2` (~865 KB, from [ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad)), fetched automatically unless you pass `--no-vad`.
 
 ## Development
 
