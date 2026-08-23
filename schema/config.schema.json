@@ -40,6 +40,17 @@
       "type": "boolean",
       "description": "Disable system audio and capture microphone input only.",
       "default": false
+    },
+    "vad": {
+      "type": "boolean",
+      "description": "Skip silence with a Silero VAD model before transcribing. Prevents whisper from looping on long silent stretches. The VAD model is downloaded on first use.",
+      "default": true
+    },
+    "chunkLength": {
+      "type": "number",
+      "description": "Seconds of audio per whisper call. whisper normalizes the spectrogram across its whole input, so feeding a long recording at once flattens quiet speech. Set to 0 to disable splitting.",
+      "minimum": 0,
+      "default": 600
     }
   },
   "additionalProperties": false
