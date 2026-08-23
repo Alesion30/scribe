@@ -37,17 +37,13 @@ final class WhisperContext {
         Log.debug("Whisper context freed")
     }
 
-    /// Transcribe Float PCM samples (16 kHz mono) and return text.
-    ///
-    /// `onSegment` fires as each segment is decoded, so callers can emit results
-    /// while a long file is still running instead of waiting for the whole thing.
-    @discardableResult
+    /// Transcribe Float PCM samples (16 kHz mono), emitting each timestamped segment as it is decoded.
     func transcribe(
         samples: [Float],
         language: String = "auto",
         showProgress: Bool = false,
-        onSegment: ((String) -> Void)? = nil
-    ) throws -> String {
+        onSegment: @escaping (TranscriptSegment) -> Void
+    ) throws -> [TranscriptSegment] {
         var params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY)
 
         let threadCount = Int32(max(1, min(8, ProcessInfo.processInfo.processorCount - 2)))
@@ -72,14 +68,19 @@ final class WhisperContext {
             let total = whisper_full_n_segments(ctx)
             for i in max(0, total - newCount)..<total {
                 guard let cStr = whisper_full_get_segment_text(ctx, i) else { continue }
-                collector.append(String(cString: cStr))
+                collector.append(
+                    TranscriptSegment(
+                        start: Self.seconds(from: whisper_full_get_segment_t0(ctx, i)),
+                        end: Self.seconds(from: whisper_full_get_segment_t1(ctx, i)),
+                        text: String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
+                    )
+                )
             }
         }
         params.new_segment_callback_user_data = Unmanaged.passUnretained(collector).toOpaque()
 
         let result: Int32 = try language.withCString { langPtr in
             params.language = langPtr
-
             return try samples.withUnsafeBufferPointer { bufferPtr in
                 guard let baseAddress = bufferPtr.baseAddress else {
                     throw WhisperError.transcriptionFailed
@@ -92,28 +93,27 @@ final class WhisperContext {
             throw WhisperError.transcriptionFailed
         }
 
-        return collector.text
+        return collector.segments
+    }
+
+    /// whisper reports segment boundaries in centiseconds.
+    private static func seconds(from timestamp: Int64) -> TimeInterval {
+        TimeInterval(timestamp) / 100.0
     }
 }
 
 /// Bridges whisper.cpp's C segment callback back into Swift.
 private final class SegmentCollector {
-    private let onSegment: ((String) -> Void)?
-    private var lines: [String] = []
+    private let onSegment: (TranscriptSegment) -> Void
+    private(set) var segments: [TranscriptSegment] = []
 
-    init(onSegment: ((String) -> Void)?) {
+    init(onSegment: @escaping (TranscriptSegment) -> Void) {
         self.onSegment = onSegment
     }
 
-    var text: String {
-        lines.joined(separator: "\n")
-    }
-
-    /// whisper pads each segment with a leading space; trim per line since we emit them one by one.
-    func append(_ segment: String) {
-        let line = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !line.isEmpty else { return }
-        lines.append(line)
-        onSegment?(line)
+    func append(_ segment: TranscriptSegment) {
+        guard !segment.text.isEmpty else { return }
+        segments.append(segment)
+        onSegment(segment)
     }
 }

@@ -10,12 +10,18 @@ final class TranscriptWriter {
 
     private let handle: FileHandle
     private let path: String?
+    private let format: TranscriptFormat
+    private var cueNumber = 0
 
-    init(path: String) throws {
+    init(path: String, format: TranscriptFormat) throws {
+        self.format = format
         if path == "-" {
             isStdout = true
             handle = .standardOutput
             self.path = nil
+            if format == .vtt {
+                handle.write(Data("WEBVTT\n\n".utf8))
+            }
             return
         }
 
@@ -29,13 +35,34 @@ final class TranscriptWriter {
         isStdout = false
         handle = file
         self.path = expanded
+        if format == .vtt {
+            handle.write(Data("WEBVTT\n\n".utf8))
+        }
     }
 
-    /// Append one segment as a line, unbuffered so an aborted run keeps what it wrote.
+    convenience init(path: String) throws {
+        try self.init(path: path, format: .txt)
+    }
+
+    /// Append one segment, unbuffered so an aborted run keeps what it wrote.
+    func write(segment: TranscriptSegment) {
+        guard !segment.text.isEmpty else { return }
+        let output: String
+        switch format {
+        case .txt:
+            output = "\(segment.text)\n"
+        case .srt:
+            cueNumber += 1
+            output = "\(cueNumber)\n\(TranscriptFormat.timecode(segment.start, millisecondSeparator: \",\")) --> \(TranscriptFormat.timecode(segment.end, millisecondSeparator: \",\"))\n\(segment.text)\n\n"
+        case .vtt:
+            output = "\(TranscriptFormat.timecode(segment.start, millisecondSeparator: \".\")) --> \(TranscriptFormat.timecode(segment.end, millisecondSeparator: \".\"))\n\(segment.text)\n\n"
+        }
+        handle.write(Data(output.utf8))
+    }
+
     func write(segment: String) {
-        let line = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !line.isEmpty else { return }
-        handle.write(Data("\(line)\n".utf8))
+        let text = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+        write(segment: TranscriptSegment(start: 0, end: 0, text: text))
     }
 
     /// Close the file and report where the transcript ended up. No-op for stdout.
