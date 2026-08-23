@@ -56,6 +56,9 @@ extension Scribe {
         @Option(name: .shortAndLong, help: "Language hint (ISO 639-1, e.g. ja, en). 'auto' for detection.")
         var language: String?
 
+        @Option(name: [.customShort("f"), .long], help: "Transcript output format.")
+        var format: TranscriptFormat?
+
         @Flag(name: .long, help: "Disable microphone input (system audio only).")
         var noMic: Bool = false
 
@@ -63,7 +66,7 @@ extension Scribe {
         var noSystem: Bool = false
 
         mutating func run() async throws {
-            let config = try resolveConfig(global: global, model: model, language: language, noMic: noMic, noSystem: noSystem)
+            let config = try resolveConfig(global: global, model: model, language: language, format: format, noMic: noMic, noSystem: noSystem)
 
             // Ensure the model exists before recording so a missing model
             // (or a declined download) doesn't waste a recording session.
@@ -82,14 +85,14 @@ extension Scribe {
             }
 
             // Transcribe
-            let text = try await performTranscription(
+            let segments = try await performTranscription(
                 samples: recording.samples,
                 modelName: config.model,
                 language: config.language
             )
 
             // Output
-            try writeOutput(text, to: output)
+            try writeOutput(config.format.render(segments), to: output)
 
             if let wav = recording.wavPath {
                 Log.status("Recording saved to: \(wav) (\(recording.spanDescription))")
@@ -156,8 +159,11 @@ extension Scribe {
         @Option(name: .shortAndLong, help: "Language hint (ISO 639-1, e.g. ja, en). 'auto' for detection.")
         var language: String?
 
+        @Option(name: [.customShort("f"), .long], help: "Transcript output format.")
+        var format: TranscriptFormat?
+
         mutating func run() async throws {
-            let config = try resolveConfig(global: global, model: model, language: language)
+            let config = try resolveConfig(global: global, model: model, language: language, format: format)
 
             let path = (input as NSString).expandingTildeInPath
             guard FileManager.default.fileExists(atPath: path) else {
@@ -168,13 +174,13 @@ extension Scribe {
             let samples = try AudioWriter.readWAV(from: path)
             Log.info("Read \(samples.count) samples (\(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s)")
 
-            let text = try await performTranscription(
+            let segments = try await performTranscription(
                 samples: samples,
                 modelName: config.model,
                 language: config.language
             )
 
-            try writeOutput(text, to: output)
+            try writeOutput(config.format.render(segments), to: output)
         }
     }
 }
@@ -281,6 +287,7 @@ extension Scribe.Model {
 private struct ResolvedConfig {
     let model: String
     let language: String
+    let format: TranscriptFormat
     let noMic: Bool
     let noSystem: Bool
     let recordingsDir: String
@@ -291,6 +298,7 @@ private func resolveConfig(
     global: GlobalOptions,
     model: String? = nil,
     language: String? = nil,
+    format: TranscriptFormat? = nil,
     noMic: Bool = false,
     noSystem: Bool = false
 ) throws -> ResolvedConfig {
@@ -302,6 +310,7 @@ private func resolveConfig(
     let resolved = ResolvedConfig(
         model: model ?? fileConfig.resolvedModel,
         language: language ?? fileConfig.resolvedLanguage,
+        format: format ?? fileConfig.resolvedFormat,
         noMic: noMic || fileConfig.resolvedNoMic,
         noSystem: noSystem || fileConfig.resolvedNoSystem,
         recordingsDir: fileConfig.resolvedRecordingsDir
@@ -310,6 +319,7 @@ private func resolveConfig(
     Log.status("Config:")
     Log.status("  model        = \(resolved.model)\(model != nil ? " (CLI)" : fileConfig.model != nil ? " (config)" : " (default)")")
     Log.status("  language     = \(resolved.language)\(language != nil ? " (CLI)" : fileConfig.language != nil ? " (config)" : " (default)")")
+    Log.status("  format       = \(resolved.format.rawValue)\(format != nil ? " (CLI)" : fileConfig.format != nil ? " (config)" : " (default)")")
     Log.status("  noMic        = \(resolved.noMic)\(noMic ? " (CLI)" : fileConfig.noMic == true ? " (config)" : " (default)")")
     Log.status("  noSystem     = \(resolved.noSystem)\(noSystem ? " (CLI)" : fileConfig.noSystem == true ? " (config)" : " (default)")")
     Log.status("  recordingsDir = \(resolved.recordingsDir)\(fileConfig.recordingDir != nil ? " (config)" : " (default)")")
@@ -423,20 +433,20 @@ private func performTranscription(
     samples: [Float],
     modelName: String,
     language: String
-) async throws -> String {
+) async throws -> [TranscriptSegment] {
     let modelPath = try await ModelManager.ensureModel(modelName)
 
     Log.status("Loading model: \(modelName)")
     let whisper = try WhisperContext(modelPath: modelPath)
 
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
-    let text = try whisper.transcribe(samples: samples, language: language)
+    let segments = try whisper.transcribe(samples: samples, language: language)
 
     if Log.verbose {
         FileHandle.standardError.write(Data("\n".utf8))
     }
 
-    return text
+    return segments
 }
 
 /// Write text to file or stdout.
