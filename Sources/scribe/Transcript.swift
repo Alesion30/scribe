@@ -50,7 +50,7 @@ extension TranscriptFormat {
     }
 
     /// Format seconds as `HH:MM:SS<sep>mmm`. Hours are not wrapped, so recordings past 100 hours widen the field.
-    private static func timecode(_ seconds: TimeInterval, millisecondSeparator: String) -> String {
+    static func timecode(_ seconds: TimeInterval, millisecondSeparator: String) -> String {
         let totalMilliseconds = Int((max(0, seconds) * 1000).rounded())
         let milliseconds = totalMilliseconds % 1000
         let totalSeconds = totalMilliseconds / 1000

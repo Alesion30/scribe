@@ -25,7 +25,7 @@ struct TranscriptionIntegrationTests {
         arguments: [
             ("sample_weather_ja", "天気"),
             ("sample_meeting_ja", "会議"),
-            ("sample_thanks_ja", "ありがとう"),
+            ("sample_thanks_ja", "ありがとう")
         ]
     )
     func transcribeJapaneseFixture(fixture: String, keyword: String) throws {
@@ -41,7 +41,7 @@ struct TranscriptionIntegrationTests {
         #expect(samples.count > 0, "Fixture has no samples")
 
         let whisper = try WhisperContext(modelPath: TestEnv.resolvedModelPath())
-        let segments = try whisper.transcribe(samples: samples, language: "ja")
+        let segments = try whisper.transcribe(samples: samples, language: "ja", onSegment: { _ in })
         #expect(!segments.isEmpty, "Transcription produced no segments")
 
         let text = TranscriptFormat.txt.render(segments)
@@ -64,7 +64,7 @@ struct TranscriptionIntegrationTests {
 
 /// Lives outside the suite so `.enabled(if:)` doesn't trigger circular
 /// macro resolution against a static member of the suite itself.
-fileprivate enum TestEnv {
+private enum TestEnv {
     static func resolvedModelPath() -> String {
         let name = ProcessInfo.processInfo.environment["SCRIBE_TEST_MODEL"]
             ?? ScribeConfig.defaultModel

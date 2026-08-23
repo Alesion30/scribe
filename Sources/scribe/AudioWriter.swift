@@ -261,21 +261,30 @@ struct AudioWriter {
     /// Estimates the noise floor from the quietest windows, then smoothly
     /// attenuates windows that are at or below the noise floor.
     static func reduceNoise(from samples: [Float]) -> [Float] {
-        let windowSize = Int(sampleRate * 0.02)  // 20ms windows
-        guard samples.count > windowSize else { return samples }
+        var result = samples
+        reduceNoise(inPlace: &result)
+        return result
+    }
 
-        let numWindows = (samples.count + windowSize - 1) / windowSize
+    /// In-place noise gate, for recordings too large to keep a second copy of.
+    static func reduceNoise(inPlace samples: inout [Float]) {
+        let windowSize = Int(sampleRate * 0.02)  // 20ms windows
+        guard samples.count > windowSize else { return }
+
+        let sampleCount = samples.count
+        let numWindows = (sampleCount + windowSize - 1) / windowSize
 
         // Compute RMS per window
         var windowRMS = [Float](repeating: 0, count: numWindows)
-        for i in 0..<numWindows {
-            let start = i * windowSize
-            let end = min(start + windowSize, samples.count)
-            let count = end - start
-            var sumSq: Float = 0
-            let slice = Array(samples[start..<end])
-            vDSP_svesq(slice, 1, &sumSq, vDSP_Length(count))
-            windowRMS[i] = sqrtf(sumSq / Float(count))
+        samples.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            for i in 0..<numWindows {
+                let start = i * windowSize
+                let count = min(windowSize, sampleCount - start)
+                var sumSq: Float = 0
+                vDSP_svesq(base + start, 1, &sumSq, vDSP_Length(count))
+                windowRMS[i] = sqrtf(sumSq / Float(count))
+            }
         }
 
         // Estimate noise floor from the quietest 20% of windows
@@ -283,7 +292,7 @@ struct AudioWriter {
         let percentileIdx = max(0, min(numWindows - 1, numWindows * 20 / 100))
         let noiseFloor = sorted[percentileIdx] * 1.5  // margin above baseline
 
-        guard noiseFloor > 0 else { return samples }
+        guard noiseFloor > 0 else { return }
 
         // Compute per-window gain with smooth transition
         var gains = [Float](repeating: 1.0, count: numWindows)
@@ -303,23 +312,23 @@ struct AudioWriter {
         }
 
         // Apply gains with per-sample linear interpolation between windows
-        var result = samples
-        for i in 0..<numWindows {
-            let start = i * windowSize
-            let end = min(start + windowSize, samples.count)
-            let currentGain = smoothed[i]
-            let nextGain = (i + 1 < numWindows) ? smoothed[i + 1] : currentGain
+        samples.withUnsafeMutableBufferPointer { buffer in
+            for i in 0..<numWindows {
+                let start = i * windowSize
+                let end = min(start + windowSize, sampleCount)
+                let currentGain = smoothed[i]
+                let nextGain = (i + 1 < numWindows) ? smoothed[i + 1] : currentGain
 
-            for j in start..<end {
-                let t = Float(j - start) / Float(windowSize)
-                let gain = currentGain + (nextGain - currentGain) * t
-                result[j] *= gain
+                for j in start..<end {
+                    let t = Float(j - start) / Float(windowSize)
+                    let gain = currentGain + (nextGain - currentGain) * t
+                    buffer[j] *= gain
+                }
             }
         }
 
         let gatedCount = smoothed.filter { $0 < 0.5 }.count
         Log.debug("Noise gate: \(numWindows) windows, noise floor RMS=\(String(format: "%.5f", noiseFloor)), gated \(gatedCount) windows")
-        return result
     }
 
     // MARK: - Normalization
@@ -327,27 +336,45 @@ struct AudioWriter {
     /// Peak-normalize samples so the loudest peak matches `targetPeak`.
     /// Amplifies quiet signals and attenuates loud signals to hit the target.
     static func normalize(_ samples: [Float], targetPeak: Float = 0.9) -> [Float] {
-        guard !samples.isEmpty else { return [] }
+        var result = samples
+        normalize(inPlace: &result, targetPeak: targetPeak)
+        return result
+    }
 
-        var peak: Float = 0
-        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+    /// In-place peak normalization, for recordings too large to keep a second copy of.
+    static func normalize(inPlace samples: inout [Float], targetPeak: Float = 0.9) {
+        guard !samples.isEmpty else { return }
 
-        guard peak > 0 else { return samples }
+        let peak = self.peak(of: samples)
+        guard peak > 0 else { return }
 
         let gain = targetPeak / peak
 
         // Skip if already within 5% of target
         if abs(gain - 1.0) < 0.05 {
             Log.debug("Peak \(String(format: "%.4f", peak)) already near target \(String(format: "%.4f", targetPeak)), skipping")
-            return samples
+            return
         }
 
-        var result = [Float](repeating: 0, count: samples.count)
-        var g = gain
-        vDSP_vsmul(samples, 1, &g, &result, 1, vDSP_Length(samples.count))
+        applyGain(gain, to: &samples)
 
         Log.debug("Normalized: peak \(String(format: "%.4f", peak)) → \(String(format: "%.4f", targetPeak)) (gain: \(String(format: "%.1f", gain))x)")
-        return result
+    }
+
+    /// Largest absolute sample value.
+    static func peak(of samples: [Float]) -> Float {
+        guard !samples.isEmpty else { return 0 }
+        var peak: Float = 0
+        vDSP_maxmgv(samples, 1, &peak, vDSP_Length(samples.count))
+        return peak
+    }
+
+    static func applyGain(_ gain: Float, to samples: inout [Float]) {
+        var g = gain
+        samples.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            vDSP_vsmul(base, 1, &g, base, 1, vDSP_Length(buffer.count))
+        }
     }
 
     // MARK: - Silence Removal
@@ -384,23 +411,19 @@ struct AudioWriter {
         // Add padding: keep 1 window before and after each voiced window
         let paddingWindows = 1
         var paddedKeep = keepWindow
-        for i in 0..<totalWindows {
-            if keepWindow[i] {
-                for j in max(0, i - paddingWindows)...min(totalWindows - 1, i + paddingWindows) {
-                    paddedKeep[j] = true
-                }
+        for i in 0..<totalWindows where keepWindow[i] {
+            for j in max(0, i - paddingWindows)...min(totalWindows - 1, i + paddingWindows) {
+                paddedKeep[j] = true
             }
         }
 
         // Collect kept samples
         var result = [Float]()
         result.reserveCapacity(samples.count)
-        for i in 0..<totalWindows {
-            if paddedKeep[i] {
-                let start = i * windowSize
-                let end = min(start + windowSize, samples.count)
-                result.append(contentsOf: samples[start..<end])
-            }
+        for i in 0..<totalWindows where paddedKeep[i] {
+            let start = i * windowSize
+            let end = min(start + windowSize, samples.count)
+            result.append(contentsOf: samples[start..<end])
         }
 
         let removedDuration = Double(samples.count - result.count) / sampleRate
@@ -434,56 +457,22 @@ struct AudioWriter {
 
     // MARK: - WAV File I/O
 
+    /// Samples converted per write when streaming a whole buffer to disk.
+    static let writeChunkSize = 1 << 16
+
     /// Write Float samples as 16kHz/mono/16-bit WAV file.
     static func writeWAV(samples: [Float], to path: String) throws {
-        let numChannels: UInt16 = 1
-        let bitsPerSample: UInt16 = 16
-        let sampleRateInt = UInt32(sampleRate)
-        let byteRate = sampleRateInt * UInt32(numChannels) * UInt32(bitsPerSample / 8)
-        let blockAlign = numChannels * (bitsPerSample / 8)
-        let dataSize = UInt32(samples.count * MemoryLayout<Int16>.size)
-        let fileSize = 36 + dataSize
+        // Chunked so a long recording doesn't need a second full copy as Int16.
+        let writer = try StreamingWAVWriter(path: path, refreshInterval: Int.max)
 
-        var data = Data(capacity: 44 + Int(dataSize))
+        var offset = 0
+        while offset < samples.count {
+            let end = min(offset + writeChunkSize, samples.count)
+            try writer.append(samples[offset..<end])
+            offset = end
+        }
+        try writer.finalize()
 
-        // RIFF header
-        data.append(contentsOf: "RIFF".utf8)
-        data.append(littleEndian: fileSize)
-        data.append(contentsOf: "WAVE".utf8)
-
-        // fmt chunk
-        data.append(contentsOf: "fmt ".utf8)
-        data.append(littleEndian: UInt32(16))       // chunk size
-        data.append(littleEndian: UInt16(1))        // PCM format
-        data.append(littleEndian: numChannels)
-        data.append(littleEndian: sampleRateInt)
-        data.append(littleEndian: byteRate)
-        data.append(littleEndian: blockAlign)
-        data.append(littleEndian: bitsPerSample)
-
-        // data chunk
-        data.append(contentsOf: "data".utf8)
-        data.append(littleEndian: dataSize)
-
-        // Convert Float [-1,1] to Int16 samples
-        var clampedSamples = samples
-        var lowerBound: Float = -1.0
-        var upperBound: Float = 1.0
-        vDSP_vclip(clampedSamples, 1, &lowerBound, &upperBound, &clampedSamples, 1, vDSP_Length(samples.count))
-
-        var scaled = [Float](repeating: 0, count: samples.count)
-        var scale: Float = 32767.0
-        vDSP_vsmul(clampedSamples, 1, &scale, &scaled, 1, vDSP_Length(samples.count))
-
-        // The clip above already bounds the range, so vDSP_vfix16 can truncate without clamping
-        var pcm = [Int16](repeating: 0, count: samples.count)
-        vDSP_vfix16(scaled, 1, &pcm, 1, vDSP_Length(samples.count))
-
-        // macOS is little-endian, so the Int16 buffer is already in WAV byte order
-        pcm.withUnsafeBufferPointer { data.append($0) }
-
-        let url = URL(fileURLWithPath: path)
-        try data.write(to: url)
         Log.debug("Wrote WAV: \(path) (\(samples.count) samples, \(String(format: "%.1f", Double(samples.count) / sampleRate))s)")
     }
 
@@ -650,7 +639,7 @@ struct AudioWriter {
 // MARK: - Audio Converter Helper
 
 /// Thread-safe state wrapper for AVAudioConverterInputBlock.
-private final class InputBlockState: @unchecked Sendable {
+final class InputBlockState: @unchecked Sendable {
     let buffer: AVAudioPCMBuffer
     var consumed = false
     init(buffer: AVAudioPCMBuffer) { self.buffer = buffer }
@@ -663,6 +652,7 @@ enum AudioWriterError: LocalizedError {
     case noChannelData
     case resamplingFailed
     case invalidWAVHeader(String)
+    case fileCreationFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -674,13 +664,15 @@ enum AudioWriterError: LocalizedError {
             return "Audio resampling failed"
         case .invalidWAVHeader(let detail):
             return "Invalid WAV header: \(detail)"
+        case .fileCreationFailed(let path):
+            return "Failed to create file: \(path)"
         }
     }
 }
 
 // MARK: - Data Helpers
 
-private extension Data {
+extension Data {
     mutating func append<T: FixedWidthInteger>(littleEndian value: T) {
         var le = value.littleEndian
         withUnsafePointer(to: &le) { ptr in
