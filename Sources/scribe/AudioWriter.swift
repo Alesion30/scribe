@@ -257,6 +257,9 @@ struct AudioWriter {
 
     // MARK: - Noise Reduction
 
+    /// Floor gain of the noise gate; digital silence makes whisper hallucinate speech.
+    private static let gateFloorGain: Float = 0.05
+
     /// Reduce background noise using a time-domain noise gate.
     /// Estimates the noise floor from the quietest windows, then smoothly
     /// attenuates windows that are at or below the noise floor.
@@ -285,14 +288,15 @@ struct AudioWriter {
 
         guard noiseFloor > 0 else { return samples }
 
-        // Compute per-window gain with smooth transition
+        // Compute per-window gain, ramping from the floor up to unity across the noise floor
         var gains = [Float](repeating: 1.0, count: numWindows)
         for i in 0..<numWindows {
             let rms = windowRMS[i]
             if rms < noiseFloor * 0.5 {
-                gains[i] = 0.0
+                gains[i] = Self.gateFloorGain
             } else if rms < noiseFloor {
-                gains[i] = (rms - noiseFloor * 0.5) / (noiseFloor * 0.5)
+                let ramp = (rms - noiseFloor * 0.5) / (noiseFloor * 0.5)
+                gains[i] = Self.gateFloorGain + (1.0 - Self.gateFloorGain) * ramp
             }
         }
 
