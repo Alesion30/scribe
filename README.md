@@ -312,6 +312,30 @@ mise run test    # swift test
 SCRIBE_TEST_MODEL=base mise run test
 ```
 
+### Lint
+
+SwiftLint の設定は `.swiftlint.yml` にある。現状は違反ゼロなので、何か報告されたらそれは変更が持ち込んだもの。
+
+```bash
+mise run lint                  # swiftlint lint --strict。警告も失敗扱いになる
+mise exec -- swiftlint --fix   # 自動修正できるルールを適用する
+```
+
+長さと命名のしきい値は既定より緩めてある。信号処理のコードでは短いループ添字や長めの関数のほうが読みやすく、既定に合わせるとコードのほうが歪むため。
+
+### CI
+
+`.github/workflows/quality.yml` が、PR と `main` への push のたびに GitHub ホストの `macos-15` runner で動く。
+
+| ジョブ | 実行内容 |
+|---|---|
+| Swift build and test | `swift build -c debug` のあと `mise run test`（どちらも mise の Swift 6.3） |
+| SwiftLint | `mise run lint` |
+
+ツールチェーンは runner 同梱の Xcode ではなく `mise.toml` のものを使う。`mise.lock` が checksum まで固定しているので、手元と CI が同じ Swift・同じ SwiftLint でビルドされる。`release.yml` も同じ mise の toolchain を使うので、PR が緑なのにリリースだけ落ちることはない。
+
+runner には whisper モデルがないので `TranscriptionIntegrationTests` はスキップされ、CI ではユニットテストだけが走る。実際の文字起こしはローカルでの確認に任せる。下記のスモークテストを実行するか、`SCRIBE_TEST_MODEL` を指定して手元のモデルで結合テストを回す。
+
 ### スモークテスト
 
 リリースビルドを作り、既知のフィクスチャが期待どおり文字起こしされるかを確認する一発実行のスクリプト。

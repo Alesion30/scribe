@@ -26,7 +26,7 @@ struct Scribe: AsyncParsableCommand {
             DefaultCommand.self,
             Record.self,
             Transcribe.self,
-            Model.self,
+            Model.self
         ],
         defaultSubcommand: DefaultCommand.self
     )
@@ -88,6 +88,7 @@ extension Scribe {
             let writer = try TranscriptWriter(path: output, format: config.format)
             defer { writer.close() }
 
+            try await performTranscription(
                 samples: recording.samples,
                 modelName: config.model,
                 language: config.language,
@@ -430,7 +431,6 @@ private func performRecording(
         }
     }
 
-
     // Start capture in background
     let captureTask = Task {
         try await capture.startCapture()
@@ -468,6 +468,7 @@ private func performRecording(
 
 /// Transcribe audio samples using whisper.cpp and forward each decoded segment immediately.
 /// Downloads the model first if it is a known model that hasn't been fetched yet.
+@discardableResult
 private func performTranscription(
     samples: [Float],
     modelName: String,

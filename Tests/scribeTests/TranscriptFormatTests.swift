@@ -10,7 +10,7 @@ struct TranscriptFormatTests {
 
     static let sample = [
         TranscriptSegment(start: 0, end: 3.48, text: "今日の会議を始めます。"),
-        TranscriptSegment(start: 3.48, end: 7.12, text: "まず先週の進捗から。"),
+        TranscriptSegment(start: 3.48, end: 7.12, text: "まず先週の進捗から。")
     ]
 
     // MARK: - txt
@@ -89,7 +89,7 @@ struct TranscriptFormatTests {
         let segments = [
             TranscriptSegment(start: 0, end: 1, text: "有効"),
             TranscriptSegment(start: 1, end: 2, text: ""),
-            TranscriptSegment(start: 2, end: 3, text: "有効"),
+            TranscriptSegment(start: 2, end: 3, text: "有効")
         ]
 
         let output = format.render(segments)

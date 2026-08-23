@@ -40,7 +40,7 @@ enum ModelManager {
         ("small", "465 MB"),
         ("medium", "1.4 GB"),
         ("large-v3-turbo", "1.5 GB"),
-        ("large-v3", "2.9 GB"),
+        ("large-v3", "2.9 GB")
     ]
 
     /// Download URL for a known model name, or nil if the name is not a standard model.
