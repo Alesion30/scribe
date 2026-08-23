@@ -468,6 +468,7 @@ private func performRecording(
 
 /// Transcribe audio samples using whisper.cpp and forward each decoded segment immediately.
 /// Downloads the model first if it is a known model that hasn't been fetched yet.
+@discardableResult
 private func performTranscription(
     samples: [Float],
     modelName: String,
