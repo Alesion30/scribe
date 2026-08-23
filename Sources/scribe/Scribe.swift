@@ -405,8 +405,16 @@ private func performRecording(
     wavPath: String?,
     config: ResolvedConfig
 ) async throws -> RecordingResult {
-    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem)
+    // Stamp the start before creating source files so every file names the session start.
+    let startedAt = Date()
+    let output = wavPath.map { ($0 as NSString).expandingTildeInPath }
+        ?? defaultWavPath(startedAt: startedAt, in: config.recordingsDir)
+    let paths = RecordingPaths(output: output)
+    try paths.prepareDirectory()
 
+    let capture = AudioCapture(captureMic: captureMic, captureSystem: captureSystem, paths: paths)
+
+    Log.status("Recording to: \(paths.output)")
     Log.status("Recording... Press Ctrl+C to stop.")
 
     // Set up SIGINT handler for graceful stop
@@ -422,8 +430,6 @@ private func performRecording(
         }
     }
 
-    // Stamp the start here: naming the WAV by its end time hides the recorded span.
-    let startedAt = Date()
 
     // Start capture in background
     let captureTask = Task {
@@ -433,9 +439,9 @@ private func performRecording(
     // Wait for SIGINT
     await stopTask.value
 
-    // Stop capture and get samples
+    // Stop capture and close the per-source recordings
     Log.status("") // newline after ^C
-    let samples = capture.stopCapture()
+    let result = capture.stopCapture()
     let endedAt = Date()
     sigintSource.cancel()
     signal(SIGINT, SIG_DFL)
@@ -443,20 +449,21 @@ private func performRecording(
     // Cancel capture task
     captureTask.cancel()
 
-    // Save WAV
-    let resolvedWavPath: String
-    if let explicit = wavPath {
-        resolvedWavPath = (explicit as NSString).expandingTildeInPath
-    } else {
-        resolvedWavPath = defaultWavPath(startedAt: startedAt, in: config.recordingsDir)
+    do {
+        let samples = try RecordingFinalizer.finalize(result, to: paths.output)
+        return RecordingResult(
+            samples: samples,
+            wavPath: samples.isEmpty ? nil : paths.output,
+            startedAt: startedAt,
+            endedAt: endedAt
+        )
+    } catch {
+        Log.error("Failed to write \(paths.output): \(error.localizedDescription)")
+        for source in result.sources {
+            Log.status("  Source recording kept: \(source.path)")
+        }
+        throw error
     }
-
-    if !samples.isEmpty {
-        try AudioWriter.writeWAV(samples: samples, to: resolvedWavPath)
-        return RecordingResult(samples: samples, wavPath: resolvedWavPath, startedAt: startedAt, endedAt: endedAt)
-    }
-
-    return RecordingResult(samples: [], wavPath: nil, startedAt: startedAt, endedAt: endedAt)
 }
 
 /// Transcribe audio samples using whisper.cpp and forward each decoded segment immediately.

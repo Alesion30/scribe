@@ -231,6 +231,22 @@ span when it saves the file:
 Recording saved to: ~/.scribe/recordings/2025-01-15_14-30-00.wav (14:30:00 → 16:37:48, 2h 7m 48s)
 ```
 
+### Crash Recovery
+
+Audio is written to disk while recording, one file per source:
+
+```
+recordings/
+├── 2025-01-15_14-30-00.mic.wav
+└── 2025-01-15_14-30-00.system.wav
+```
+
+When you stop recording, these are mixed into `2025-01-15_14-30-00.wav` and deleted. If scribe is killed or the machine loses power, they stay behind as playable WAVs covering everything captured up to the last second, and can be transcribed directly:
+
+```bash
+scribe transcribe ~/.scribe/recordings/2025-01-15_14-30-00.mic.wav
+```
+
 ## Permissions
 
 On first run, macOS will prompt for the following permissions:
