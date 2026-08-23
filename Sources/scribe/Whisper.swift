@@ -70,8 +70,8 @@ final class WhisperContext {
                 guard let cStr = whisper_full_get_segment_text(ctx, i) else { continue }
                 collector.append(
                     TranscriptSegment(
-                        start: Self.seconds(from: whisper_full_get_segment_t0(ctx, i)),
-                        end: Self.seconds(from: whisper_full_get_segment_t1(ctx, i)),
+                        start: WhisperContext.seconds(from: whisper_full_get_segment_t0(ctx, i)),
+                        end: WhisperContext.seconds(from: whisper_full_get_segment_t1(ctx, i)),
                         text: String(cString: cStr).trimmingCharacters(in: .whitespacesAndNewlines)
                     )
                 )

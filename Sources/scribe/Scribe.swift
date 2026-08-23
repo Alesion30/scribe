@@ -88,6 +88,7 @@ extension Scribe {
             let writer = try TranscriptWriter(path: output, format: config.format)
             defer { writer.close() }
 
+            try await performTranscription(
                 samples: recording.samples,
                 modelName: config.model,
                 language: config.language,

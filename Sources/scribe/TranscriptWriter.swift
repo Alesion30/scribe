@@ -53,9 +53,9 @@ final class TranscriptWriter {
             output = "\(segment.text)\n"
         case .srt:
             cueNumber += 1
-            output = "\(cueNumber)\n\(TranscriptFormat.timecode(segment.start, millisecondSeparator: \",\")) --> \(TranscriptFormat.timecode(segment.end, millisecondSeparator: \",\"))\n\(segment.text)\n\n"
+            output = "\(cueNumber)\n\(TranscriptFormat.timecode(segment.start, millisecondSeparator: ",")) --> \(TranscriptFormat.timecode(segment.end, millisecondSeparator: ","))\n\(segment.text)\n\n"
         case .vtt:
-            output = "\(TranscriptFormat.timecode(segment.start, millisecondSeparator: \".\")) --> \(TranscriptFormat.timecode(segment.end, millisecondSeparator: \".\"))\n\(segment.text)\n\n"
+            output = "\(TranscriptFormat.timecode(segment.start, millisecondSeparator: ".")) --> \(TranscriptFormat.timecode(segment.end, millisecondSeparator: "."))\n\(segment.text)\n\n"
         }
         handle.write(Data(output.utf8))
     }
