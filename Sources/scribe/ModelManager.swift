@@ -43,10 +43,22 @@ enum ModelManager {
         ("large-v3", "2.9 GB")
     ]
 
+    /// Silero VAD for skipping silence, kept out of the model lists since it cannot transcribe.
+    static let vadModel = (name: "silero-v5.1.2", approxSize: "865 KB")
+
     /// Download URL for a known model name, or nil if the name is not a standard model.
     static func knownModelURL(for name: String) -> URL? {
+        if name == vadModel.name {
+            return URL(string: "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-\(name).bin")
+        }
         guard knownModels.contains(where: { $0.name == name }) else { return nil }
         return URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-\(name).bin")
+    }
+
+    /// Approximate download size for a known model name.
+    private static func knownModelSize(for name: String) -> String? {
+        if name == vadModel.name { return vadModel.approxSize }
+        return knownModels.first { $0.name == name }?.approxSize
     }
 
     /// Resolve a model to a local file path, downloading known models that are missing.
@@ -61,7 +73,7 @@ enum ModelManager {
             throw ModelManagerError.modelFileMissing(nameOrPath, path)
         }
 
-        let size = knownModels.first { $0.name == nameOrPath }?.approxSize ?? "?"
+        let size = knownModelSize(for: nameOrPath) ?? "?"
         if isatty(STDIN_FILENO) != 0 {
             FileHandle.standardError.write(Data("Model '\(nameOrPath)' is not downloaded (\(size)). Download now? [Y/n] ".utf8))
             let answer = (readLine() ?? "").trimmingCharacters(in: .whitespaces).lowercased()
@@ -154,7 +166,7 @@ enum ModelManager {
 
         let contents = try fm.contentsOfDirectory(atPath: modelsDir)
         return contents
-            .filter { $0.hasSuffix(".bin") }
+            .filter { $0.hasSuffix(".bin") && $0 != "\(vadModel.name).bin" }
             .sorted()
             .compactMap { filename -> ModelInfo? in
                 let path = (modelsDir as NSString).appendingPathComponent(filename)

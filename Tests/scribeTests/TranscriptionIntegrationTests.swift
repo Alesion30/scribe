@@ -41,7 +41,11 @@ struct TranscriptionIntegrationTests {
         #expect(samples.count > 0, "Fixture has no samples")
 
         let whisper = try WhisperContext(modelPath: TestEnv.resolvedModelPath())
-        let segments = try whisper.transcribe(samples: samples, language: "ja", onSegment: { _ in })
+        let segments = try whisper.transcribe(
+            samples: samples,
+            options: TranscribeOptions(language: "ja"),
+            onSegment: { _ in }
+        )
         #expect(!segments.isEmpty, "Transcription produced no segments")
 
         let text = TranscriptFormat.txt.render(segments)

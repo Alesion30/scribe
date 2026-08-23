@@ -9,6 +9,8 @@ struct ScribeConfig: Codable {
     var noMic: Bool?
     var noSystem: Bool?
     var format: TranscriptFormat?
+    var vad: Bool?
+    var chunkLength: Double?
 
     enum CodingKeys: String, CodingKey {
         case model
@@ -17,6 +19,8 @@ struct ScribeConfig: Codable {
         case noMic
         case noSystem
         case format
+        case vad
+        case chunkLength
     }
 
     // MARK: - Defaults
@@ -24,12 +28,16 @@ struct ScribeConfig: Codable {
     static let defaultModel = "large-v3-turbo"
     static let defaultLanguage = "auto"
     static let defaultFormat = TranscriptFormat.txt
+    static let defaultVAD = true
+    static let defaultChunkLength: Double = 600
 
     var resolvedModel: String { model ?? Self.defaultModel }
     var resolvedLanguage: String { language ?? Self.defaultLanguage }
     var resolvedNoMic: Bool { noMic ?? false }
     var resolvedNoSystem: Bool { noSystem ?? false }
     var resolvedFormat: TranscriptFormat { format ?? Self.defaultFormat }
+    var resolvedVAD: Bool { vad ?? Self.defaultVAD }
+    var resolvedChunkLength: Double { chunkLength ?? Self.defaultChunkLength }
 
     // MARK: - Directories
 

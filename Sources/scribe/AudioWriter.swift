@@ -2,7 +2,7 @@
 import CoreMedia
 import Accelerate
 
-/// Handles WAV file writing, audio format conversion, mixing, and silence removal.
+/// Handles WAV file writing, audio format conversion, mixing, and noise reduction.
 struct AudioWriter {
     /// Target format for whisper.cpp: 16kHz, mono, 16-bit signed PCM.
     static let sampleRate: Double = 16000
@@ -257,6 +257,9 @@ struct AudioWriter {
 
     // MARK: - Noise Reduction
 
+    /// Floor gain of the noise gate; digital silence makes whisper hallucinate speech.
+    private static let gateFloorGain: Float = 0.05
+
     /// Reduce background noise using a time-domain noise gate.
     /// Estimates the noise floor from the quietest windows, then smoothly
     /// attenuates windows that are at or below the noise floor.
@@ -294,14 +297,15 @@ struct AudioWriter {
 
         guard noiseFloor > 0 else { return }
 
-        // Compute per-window gain with smooth transition
+        // Compute per-window gain, ramping from the floor up to unity across the noise floor
         var gains = [Float](repeating: 1.0, count: numWindows)
         for i in 0..<numWindows {
             let rms = windowRMS[i]
             if rms < noiseFloor * 0.5 {
-                gains[i] = 0.0
+                gains[i] = Self.gateFloorGain
             } else if rms < noiseFloor {
-                gains[i] = (rms - noiseFloor * 0.5) / (noiseFloor * 0.5)
+                let ramp = (rms - noiseFloor * 0.5) / (noiseFloor * 0.5)
+                gains[i] = Self.gateFloorGain + (1.0 - Self.gateFloorGain) * ramp
             }
         }
 
@@ -375,63 +379,6 @@ struct AudioWriter {
             guard let base = buffer.baseAddress else { return }
             vDSP_vsmul(base, 1, &g, base, 1, vDSP_Length(buffer.count))
         }
-    }
-
-    // MARK: - Silence Removal
-
-    /// Remove silence segments based on RMS threshold.
-    /// Uses a sliding window approach, keeping windows above the threshold with small padding.
-    static func removeSilence(
-        from samples: [Float],
-        sampleRate: Double = 16000,
-        windowSize: Int = 1600,
-        threshold: Float = 0.01
-    ) -> [Float] {
-        guard !samples.isEmpty else { return [] }
-
-        let totalWindows = (samples.count + windowSize - 1) / windowSize
-        var keepWindow = [Bool](repeating: false, count: totalWindows)
-
-        // Calculate RMS for each window and mark which to keep
-        for i in 0..<totalWindows {
-            let start = i * windowSize
-            let end = min(start + windowSize, samples.count)
-            let windowSamples = Array(samples[start..<end])
-            let count = vDSP_Length(windowSamples.count)
-
-            var sumSquares: Float = 0
-            vDSP_svesq(windowSamples, 1, &sumSquares, count)
-            let rms = sqrtf(sumSquares / Float(windowSamples.count))
-
-            if rms >= threshold {
-                keepWindow[i] = true
-            }
-        }
-
-        // Add padding: keep 1 window before and after each voiced window
-        let paddingWindows = 1
-        var paddedKeep = keepWindow
-        for i in 0..<totalWindows where keepWindow[i] {
-            for j in max(0, i - paddingWindows)...min(totalWindows - 1, i + paddingWindows) {
-                paddedKeep[j] = true
-            }
-        }
-
-        // Collect kept samples
-        var result = [Float]()
-        result.reserveCapacity(samples.count)
-        for i in 0..<totalWindows where paddedKeep[i] {
-            let start = i * windowSize
-            let end = min(start + windowSize, samples.count)
-            result.append(contentsOf: samples[start..<end])
-        }
-
-        let removedDuration = Double(samples.count - result.count) / sampleRate
-        if removedDuration > 0.1 {
-            Log.debug("Removed \(String(format: "%.1f", removedDuration))s of silence")
-        }
-
-        return result
     }
 
     // MARK: - Slicing

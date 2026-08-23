@@ -9,6 +9,7 @@
 - **逐次出力** — 文字起こしはデコードできたセグメントから順に書き出すので、長いファイルでも進捗が見え、途中で止めてもそこまでの結果が残る
 - **柔軟なワークフロー** — 録音と文字起こしを一度に実行することも、個別に実行することもできる
 - **時間範囲の文字起こし** — ファイルを切り出さずに、指定した区間だけを文字起こしできる
+- **長時間録音への対応** — 長い音声を分割し、無音は VAD で飛ばすので、静かな区間で同じ行を繰り返さない
 - **言語判定** — 自動判定、または ISO 639-1 コードでの明示指定
 - **タイムスタンプ付き出力** — プレーンテキストのほか、セグメントごとの時刻を持つ SRT / WebVTT を出力できる
 - **モデル管理** — whisper モデルのダウンロード・一覧・削除を CLI から実行
@@ -141,7 +142,25 @@ scribe transcribe recording.wav --start 600
 
 # プレーンテキストではなく WebVTT として書き出す
 scribe transcribe recording.wav -f vtt
+
+# 無音を飛ばさず、音声をそのまま whisper に渡す
+scribe transcribe recording.wav --no-vad
 ```
+
+### 長時間の録音
+
+whisper は音声のスペクトログラムを、渡された範囲全体の最大フレームを基準に正規化し、そこから 80 dB 下を床に丸める。1 時間分を一度に渡すと大きな音がひとつあるだけで残りが床に沈み、デコーダはそれ以降ずっと同じ行を繰り返す。長い無音があるとデコードの手がかりがなくなり、さらに起きやすくなる。
+
+scribe は既定でこの両方を避ける。
+
+| オプション | 既定値 | 説明 |
+|---|---|---|
+| `--chunk-length <seconds>` | `600` | whisper 1 回あたりに渡す音声の長さ。正規化がこの範囲に閉じる。`0` にすると分割せず全体を渡す |
+| `--vad` / `--no-vad` | 有効 | Silero VAD で無音を飛ばす。タイムスタンプは元の音声を指したまま変わらない |
+
+VAD モデル（約 865 KB）は初回利用時に `~/.scribe/models/` へダウンロードされる。文字起こし用のモデルではないので `scribe model list` には出ない。
+
+同じ行が連続した場合は最初の 1 件だけを残す。分割と VAD をすり抜けたループがあっても、残りの文字起こしが埋もれない。
 
 ### 出力形式
 
@@ -224,6 +243,8 @@ scribe の設定は階層的に解決される。優先度は高い順に次の�
   "language": "auto",
   "format": "txt",
   "recordingDir": "~/.scribe/recordings",
+  "vad": true,
+  "chunkLength": 600,
   "noMic": false,
   "noSystem": false
 }
@@ -243,7 +264,8 @@ scribe の設定は階層的に解決される。優先度は高い順に次の�
 ~/.scribe/
 ├── config.json        # 設定ファイル（任意）
 ├── models/            # ダウンロードした whisper モデル
-│   └── base.bin
+│   ├── base.bin
+│   └── silero-v5.1.2.bin   # VAD モデル（初回利用時に取得）
 └── recordings/        # 保存した録音データ
     └── 2025-01-15_14-30-00.wav
 ```
@@ -293,6 +315,8 @@ scribe transcribe ~/.scribe/recordings/2025-01-15_14-30-00.mic.wav
 | `large-v3` | 約 2.9 GB | 最も精度が高い |
 
 これらの標準モデルは名前だけでダウンロードできる（`scribe model download <name>`）。実体は [Hugging Face](https://huggingface.co/ggerganov/whisper.cpp/tree/main) で `ggml-*.bin` として公開されているもの。
+
+無音の読み飛ばしにはこれとは別に `silero-v5.1.2`（約 865 KB、[ggml-org/whisper-vad](https://huggingface.co/ggml-org/whisper-vad) 提供）を使う。`--no-vad` を付けない限り自動で取得される。
 
 ## 開発
 

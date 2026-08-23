@@ -59,6 +59,12 @@ extension Scribe {
         @Option(name: [.customShort("f"), .long], help: "Transcript output format.")
         var format: TranscriptFormat?
 
+        @Flag(name: .long, inversion: .prefixedNo, help: "Skip silence with a VAD model before transcribing.")
+        var vad: Bool?
+
+        @Option(name: .long, help: "Seconds of audio per whisper call (0 to disable splitting).")
+        var chunkLength: Double?
+
         @Flag(name: .long, help: "Disable microphone input (system audio only).")
         var noMic: Bool = false
 
@@ -66,7 +72,16 @@ extension Scribe {
         var noSystem: Bool = false
 
         mutating func run() async throws {
-            let config = try resolveConfig(global: global, model: model, language: language, format: format, noMic: noMic, noSystem: noSystem)
+            let config = try resolveConfig(
+                global: global,
+                model: model,
+                language: language,
+                format: format,
+                vad: vad,
+                chunkLength: chunkLength,
+                noMic: noMic,
+                noSystem: noSystem
+            )
 
             // Ensure the model exists before recording so a missing model
             // (or a declined download) doesn't waste a recording session.
@@ -90,8 +105,7 @@ extension Scribe {
 
             try await performTranscription(
                 samples: recording.samples,
-                modelName: config.model,
-                language: config.language,
+                config: config,
                 onSegment: writer.write
             )
 
@@ -169,8 +183,21 @@ extension Scribe {
         @Option(name: [.customShort("f"), .long], help: "Transcript output format.")
         var format: TranscriptFormat?
 
+        @Flag(name: .long, inversion: .prefixedNo, help: "Skip silence with a VAD model before transcribing.")
+        var vad: Bool?
+
+        @Option(name: .long, help: "Seconds of audio per whisper call (0 to disable splitting).")
+        var chunkLength: Double?
+
         mutating func run() async throws {
-            let config = try resolveConfig(global: global, model: model, language: language, format: format)
+            let config = try resolveConfig(
+                global: global,
+                model: model,
+                language: language,
+                format: format,
+                vad: vad,
+                chunkLength: chunkLength
+            )
 
             // Reject a bad range up front so a long WAV isn't decoded for nothing.
             guard start.isFinite, start >= 0 else {
@@ -210,8 +237,7 @@ extension Scribe {
 
             try await performTranscription(
                 samples: samples,
-                modelName: config.model,
-                language: config.language,
+                config: config,
                 onSegment: writer.write
             )
         }
@@ -321,6 +347,8 @@ private struct ResolvedConfig {
     let model: String
     let language: String
     let format: TranscriptFormat
+    let vad: Bool
+    let chunkLength: Double
     let noMic: Bool
     let noSystem: Bool
     let recordingsDir: String
@@ -332,6 +360,8 @@ private func resolveConfig(
     model: String? = nil,
     language: String? = nil,
     format: TranscriptFormat? = nil,
+    vad: Bool? = nil,
+    chunkLength: Double? = nil,
     noMic: Bool = false,
     noSystem: Bool = false
 ) throws -> ResolvedConfig {
@@ -340,10 +370,16 @@ private func resolveConfig(
     let fileConfig = try ScribeConfig.load()
     try fileConfig.ensureDirectories()
 
+    if let chunkLength, !chunkLength.isFinite || chunkLength < 0 {
+        throw ScribeError.invalidChunkLength(chunkLength)
+    }
+
     let resolved = ResolvedConfig(
         model: model ?? fileConfig.resolvedModel,
         language: language ?? fileConfig.resolvedLanguage,
         format: format ?? fileConfig.resolvedFormat,
+        vad: vad ?? fileConfig.resolvedVAD,
+        chunkLength: chunkLength ?? fileConfig.resolvedChunkLength,
         noMic: noMic || fileConfig.resolvedNoMic,
         noSystem: noSystem || fileConfig.resolvedNoSystem,
         recordingsDir: fileConfig.resolvedRecordingsDir
@@ -353,6 +389,8 @@ private func resolveConfig(
     Log.status("  model        = \(resolved.model)\(model != nil ? " (CLI)" : fileConfig.model != nil ? " (config)" : " (default)")")
     Log.status("  language     = \(resolved.language)\(language != nil ? " (CLI)" : fileConfig.language != nil ? " (config)" : " (default)")")
     Log.status("  format       = \(resolved.format.rawValue)\(format != nil ? " (CLI)" : fileConfig.format != nil ? " (config)" : " (default)")")
+    Log.status("  vad          = \(resolved.vad)\(vad != nil ? " (CLI)" : fileConfig.vad != nil ? " (config)" : " (default)")")
+    Log.status("  chunkLength  = \(resolved.chunkLength)s\(chunkLength != nil ? " (CLI)" : fileConfig.chunkLength != nil ? " (config)" : " (default)")")
     Log.status("  noMic        = \(resolved.noMic)\(noMic ? " (CLI)" : fileConfig.noMic == true ? " (config)" : " (default)")")
     Log.status("  noSystem     = \(resolved.noSystem)\(noSystem ? " (CLI)" : fileConfig.noSystem == true ? " (config)" : " (default)")")
     Log.status("  recordingsDir = \(resolved.recordingsDir)\(fileConfig.recordingDir != nil ? " (config)" : " (default)")")
@@ -471,19 +509,23 @@ private func performRecording(
 @discardableResult
 private func performTranscription(
     samples: [Float],
-    modelName: String,
-    language: String,
+    config: ResolvedConfig,
     onSegment: @escaping (TranscriptSegment) -> Void
 ) async throws -> [TranscriptSegment] {
-    let modelPath = try await ModelManager.ensureModel(modelName)
+    let modelPath = try await ModelManager.ensureModel(config.model)
 
-    Log.status("Loading model: \(modelName)")
+    var options = TranscribeOptions(language: config.language, chunkLength: config.chunkLength)
+    if config.vad {
+        options.vadModelPath = try await ModelManager.ensureModel(ModelManager.vadModel.name)
+    }
+
+    Log.status("Loading model: \(config.model)")
     let whisper = try WhisperContext(modelPath: modelPath)
 
     Log.status("Transcribing \(String(format: "%.1f", Double(samples.count) / AudioWriter.sampleRate))s of audio...")
     return try whisper.transcribe(
         samples: samples,
-        language: language,
+        options: options,
         showProgress: Log.verbose,
         onSegment: onSegment
     )
@@ -498,6 +540,7 @@ enum ScribeError: LocalizedError {
     case invalidURL(String)
     case cannotWriteOutput(String)
     case invalidTimeRange(String)
+    case invalidChunkLength(Double)
 
     var errorDescription: String? {
         switch self {
@@ -517,6 +560,8 @@ enum ScribeError: LocalizedError {
             return "Cannot write transcript to: \(path)"
         case .invalidTimeRange(let reason):
             return "Invalid time range: \(reason)"
+        case .invalidChunkLength(let seconds):
+            return "Invalid --chunk-length \(seconds): must be zero or greater"
         }
     }
 }
