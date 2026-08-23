@@ -351,12 +351,15 @@ mise exec -- swiftlint --fix   # 自動修正できるルールを適用する
 
 ### CI
 
-`.github/workflows/quality.yml` が、PR と `main` への push のたびに GitHub ホストの `macos-15` runner で動く。
+`.github/workflows/quality.yml` が、PR と `main` への push のたびに動く。Swift のビルドとテストは GitHub ホストの `macos-15` runner、PR タイトルの検証は `ubuntu-latest` で走る。
 
 | ジョブ | 実行内容 |
 |---|---|
+| Conventional PR title | PR タイトルが Conventional Commits に沿っているかを検証する |
 | Swift build and test | `swift build -c debug` のあと `mise run test`（どちらも mise の Swift 6.3） |
 | SwiftLint | `mise run lint` |
+
+squash merge のコミット subject は PR タイトルから作られ、それがリリースの採番に使われる。そのためタイトルを編集したときも検証し直す。逆にタイトルや本文だけの編集では Swift のジョブは走らせない。
 
 ツールチェーンは runner 同梱の Xcode ではなく `mise.toml` のものを使う。`mise.lock` が checksum まで固定しているので、手元と CI が同じ Swift・同じ SwiftLint でビルドされる。`release.yml` も同じ mise の toolchain を使うので、PR が緑なのにリリースだけ落ちることはない。
 
