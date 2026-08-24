@@ -369,16 +369,39 @@ mise exec -- swiftlint --fix   # 自動修正できるルールを適用する
 
 ### CI
 
-`.github/workflows/quality.yml` が、PR と `main` への push のたびに GitHub ホストの `macos-15` runner で動く。
+`.github/workflows/quality.yml` が、PR と `main` への push のたびに動く。Swift のビルドとテストは GitHub ホストの `macos-15` runner、PR タイトルの検証は `ubuntu-latest` で走る。
 
 | ジョブ | 実行内容 |
 |---|---|
+| Conventional PR title | PR タイトルが Conventional Commits に沿っているかを検証する |
 | Swift build and test | `swift build -c debug` のあと `mise run test`（どちらも mise の Swift 6.3） |
 | SwiftLint | `mise run lint` |
+
+squash merge のコミット subject は PR タイトルから作られ、それがリリースの採番に使われる。そのためタイトルを編集したときも検証し直す。逆にタイトルや本文だけの編集では Swift のジョブは走らせない。
 
 ツールチェーンは runner 同梱の Xcode ではなく `mise.toml` のものを使う。`mise.lock` が checksum まで固定しているので、手元と CI が同じ Swift・同じ SwiftLint でビルドされる。`release.yml` も同じ mise の toolchain を使うので、PR が緑なのにリリースだけ落ちることはない。
 
 runner には whisper モデルがないので `TranscriptionIntegrationTests` はスキップされ、CI ではユニットテストだけが走る。実際の文字起こしはローカルでの確認に任せる。下記のスモークテストを実行するか、`SCRIBE_TEST_MODEL` を指定して手元のモデルで結合テストを回す。
+
+### リリース
+
+`main` で `.github/workflows/release.yml` を `workflow_dispatch` から実行すると、バージョンの採番から Release の公開までが一度に走る。
+
+次のバージョンは、前回のリリースタグ以降に `main` へ入ったコミットの subject から決まる。
+
+| コミット | 上げ幅 |
+|---|---|
+| `feat:` | minor |
+| `fix:` / `perf:` | patch |
+| `!` 付き、または本文に `BREAKING CHANGE:` | major |
+
+`docs:` や `chore:` しかない場合は、Release を作らずに理由を出して失敗する。手元で次のバージョンを確認するには `./scripts/next-version.sh` を実行する。
+
+採番したバージョンは `Sources/scribe/Scribe.swift` に書き戻され、`chore(release): vX.Y.Z` として `main` にコミットされる。タグと Release はこのコミットを指すので、バージョン文字列を手で書き換える必要はない。
+
+公開済みのタグと Release は書き換えない。同じタグが既にあればビルドを始める前に止まる。
+
+コミットは GitHub App のトークンで作る。`main` の ruleset を bypass するためで、`RELEASE_APP_ID` と `RELEASE_APP_PRIVATE_KEY` の 2 つの Secret を必要とする。
 
 ### スモークテスト
 
