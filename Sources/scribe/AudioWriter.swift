@@ -260,6 +260,9 @@ struct AudioWriter {
     /// Floor gain of the noise gate; digital silence makes whisper hallucinate speech.
     private static let gateFloorGain: Float = 0.05
 
+    /// How far under the speaking level the noise floor is allowed to sit, at most.
+    private static let noiseFloorCeilingRatio: Float = 0.25
+
     /// Reduce background noise using a time-domain noise gate.
     /// Estimates the noise floor from the quietest windows, then smoothly
     /// attenuates windows that are at or below the noise floor.
@@ -271,7 +274,8 @@ struct AudioWriter {
 
     /// In-place noise gate, for recordings too large to keep a second copy of.
     static func reduceNoise(inPlace samples: inout [Float]) {
-        let windowSize = Int(sampleRate * 0.02)  // 20ms windows
+        // Shared with LevelMeter so the active level below is read off the same window size.
+        let windowSize = LevelMeter.windowSamples
         guard samples.count > windowSize else { return }
 
         let sampleCount = samples.count
@@ -293,7 +297,12 @@ struct AudioWriter {
         // Estimate noise floor from the quietest 20% of windows
         let sorted = windowRMS.sorted()
         let percentileIdx = max(0, min(numWindows - 1, numWindows * 20 / 100))
-        let noiseFloor = sorted[percentileIdx] * 1.5  // margin above baseline
+        let baseline = sorted[percentileIdx] * 1.5  // margin above baseline
+
+        // With speech packed back to back even the quietest fifth is speech, and a floor estimated
+        // from it climbs into the voice. Hold it below the level the recording actually speaks at.
+        let activeLevel = sorted[max(0, numWindows - LevelMeter.activeRank(windowCount: numWindows))]
+        let noiseFloor = min(baseline, activeLevel * noiseFloorCeilingRatio)
 
         guard noiseFloor > 0 else { return }
 

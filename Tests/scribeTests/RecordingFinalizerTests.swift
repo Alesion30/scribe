@@ -54,11 +54,17 @@ struct RecordingFinalizerTests {
         try writer.append(samples)
         try writer.finalize()
 
-        return CapturedSource(
+        return capturedSource(samples, path: path, startSeconds: startSeconds)
+    }
+
+    /// The stats SourceRecorder would have accumulated while streaming these samples to disk.
+    static func capturedSource(_ samples: [Float], path: String = "", startSeconds: Double? = nil) -> CapturedSource {
+        CapturedSource(
             path: path,
             sampleCount: samples.count,
             peak: peak(samples),
             rms: rms(samples),
+            activeLevel: LevelMeter.activeLevel(of: samples),
             startSeconds: startSeconds
         )
     }
@@ -68,15 +74,12 @@ struct RecordingFinalizerTests {
         var resampledMic = mic
         var resampledSystem = system
 
-        if rms(resampledSystem) < 0.01 { resampledSystem = [] }
-        if rms(resampledMic) < 0.01 { resampledMic = [] }
+        let threshold = RecordingFinalizer.silenceLevelThreshold
+        if LevelMeter.activeLevel(of: resampledSystem) < threshold { resampledSystem = [] }
+        if LevelMeter.activeLevel(of: resampledMic) < threshold { resampledMic = [] }
 
-        if !resampledMic.isEmpty {
-            resampledMic = AudioWriter.normalize(resampledMic, targetPeak: 0.5)
-        }
-        if !resampledSystem.isEmpty {
-            resampledSystem = AudioWriter.normalize(resampledSystem, targetPeak: 0.5)
-        }
+        applyMixGain(to: &resampledMic)
+        applyMixGain(to: &resampledSystem)
 
         let mixed: [Float]
         if !resampledMic.isEmpty && !resampledSystem.isEmpty {
@@ -90,6 +93,12 @@ struct RecordingFinalizerTests {
         }
 
         return AudioWriter.normalize(AudioWriter.reduceNoise(from: mixed))
+    }
+
+    /// The gain the finalizer would give this buffer, applied in place.
+    static func applyMixGain(to samples: inout [Float]) {
+        guard !samples.isEmpty else { return }
+        AudioWriter.applyGain(RecordingFinalizer.mixGain(for: capturedSource(samples)), to: &samples)
     }
 
     static func maxDelta(_ lhs: [Float], _ rhs: [Float]) -> Float {
@@ -177,6 +186,100 @@ struct RecordingFinalizerTests {
         }
     }
 
+    // MARK: - Audibility
+
+    /// A microphone whose input level is set low, talked into for a fraction of the session.
+    ///
+    /// Modelled on a recording this used to throw away: speech reaching -38 dBFS over room tone at
+    /// -57 dBFS, with 29% of the session spent talking. Its overall RMS lands under the 0.01 the
+    /// finalizer used to test, so the whole source was dropped and the run failed with no audio.
+    static func quietSparseSpeech(seconds: Double) -> [Float] {
+        let count = Int(AudioWriter.sampleRate * seconds)
+        let speech = tone(frequency: 300, amplitude: 0.017, count: count)
+        return (0..<count).map { i in
+            let inSpeech = Double(i % Int(AudioWriter.sampleRate * 3.5)) < AudioWriter.sampleRate
+            return inSpeech ? speech[i] : Float.random(in: -0.0024...0.0024)
+        }
+    }
+
+    @Test("A quiet microphone talked into occasionally is kept")
+    func quietSparseSpeechIsKept() throws {
+        let mic = Self.quietSparseSpeech(seconds: 9)
+        #expect(Self.rms(mic) < 0.01, "the case only bites while overall RMS is under the old threshold")
+
+        try Self.withTemporaryDirectory { dir in
+            let paths = RecordingPaths(output: (dir as NSString).appendingPathComponent("out.wav"))
+            let result = CaptureResult(mic: try Self.writeSource(mic, to: paths.mic), system: nil)
+
+            #expect(try !RecordingFinalizer.finalize(result, to: paths.output).isEmpty)
+        }
+    }
+
+    @Test("A long silent stretch does not turn speech into silence")
+    func sessionLengthDoesNotDecideAudibility() throws {
+        let speech = Self.quietSparseSpeech(seconds: 9)
+        let block = (0..<LevelMeter.windowSamples).map { _ in Float.random(in: -0.0024...0.0024) }
+        var mic = speech
+        // Ten minutes of room tone: enough to bury the overall RMS the finalizer used to judge on.
+        while mic.count < Int(AudioWriter.sampleRate * 600) {
+            mic.append(contentsOf: block)
+        }
+        #expect(Self.rms(mic) < 0.002, "the silence has to actually swamp the speech")
+
+        try Self.withTemporaryDirectory { dir in
+            let paths = RecordingPaths(output: (dir as NSString).appendingPathComponent("out.wav"))
+            let result = CaptureResult(mic: try Self.writeSource(mic, to: paths.mic), system: nil)
+
+            #expect(try !RecordingFinalizer.finalize(result, to: paths.output).isEmpty)
+        }
+    }
+
+    @Test("Digital silence is still excluded")
+    func digitalSilenceIsStillExcluded() throws {
+        let mic = Self.speechLike(count: 32000)
+        let system = [Float](repeating: 0, count: 32000)
+
+        try Self.withTemporaryDirectory { dir in
+            let paths = RecordingPaths(output: (dir as NSString).appendingPathComponent("out.wav"))
+            let result = CaptureResult(
+                mic: try Self.writeSource(mic, to: paths.mic),
+                system: try Self.writeSource(system, to: paths.system)
+            )
+
+            let mixed = try RecordingFinalizer.finalize(result, to: paths.output)
+
+            #expect(Self.maxDelta(mixed, Self.referenceMix(mic: mic, system: [])) < 0.01)
+        }
+    }
+
+    // MARK: - Mix gain
+
+    @Test("One click does not decide the gain for the whole recording")
+    func clickDoesNotDecideTheGain() {
+        let speech = Self.tone(frequency: 300, amplitude: 0.1, count: 160000)
+        var withClick = speech
+        for i in 0..<(LevelMeter.windowSamples * 2) {
+            withClick[16000 + i] = i.isMultiple(of: 2) ? 1.0 : -1.0
+        }
+
+        let clean = RecordingFinalizer.mixGain(for: Self.capturedSource(speech))
+        let clicked = RecordingFinalizer.mixGain(for: Self.capturedSource(withClick))
+
+        // Matching peaks would have cut this to a tenth; the ceiling is all that still moves it.
+        #expect(clicked / clean > 0.5, "gain fell from \(clean) to \(clicked)")
+    }
+
+    @Test("Sources meet the mix at a comparable level")
+    func sourcesMeetAtAComparableLevel() {
+        let quiet = Self.tone(frequency: 300, amplitude: 0.02, count: 160000)
+        let loud = Self.tone(frequency: 300, amplitude: 0.5, count: 160000)
+
+        let quietLevel = LevelMeter.activeLevel(of: quiet) * RecordingFinalizer.mixGain(for: Self.capturedSource(quiet))
+        let loudLevel = LevelMeter.activeLevel(of: loud) * RecordingFinalizer.mixGain(for: Self.capturedSource(loud))
+
+        #expect(abs(quietLevel - loudLevel) / loudLevel < 0.05, "\(quietLevel) against \(loudLevel)")
+    }
+
     // MARK: - Stream alignment
 
     @Test("A source that started later is held back by the difference")
@@ -221,9 +324,9 @@ struct RecordingFinalizerTests {
     @Test("Lead-in silence is measured from the earliest source")
     func leadSamplesMeasuredFromEarliest() {
         let sources = [
-            CapturedSource(path: "a", sampleCount: 16000, peak: 1, rms: 1, startSeconds: 100.5),
-            CapturedSource(path: "b", sampleCount: 16000, peak: 1, rms: 1, startSeconds: 100.0),
-            CapturedSource(path: "c", sampleCount: 16000, peak: 1, rms: 1, startSeconds: 101.0)
+            CapturedSource(path: "a", sampleCount: 16000, peak: 1, rms: 1, activeLevel: 1, startSeconds: 100.5),
+            CapturedSource(path: "b", sampleCount: 16000, peak: 1, rms: 1, activeLevel: 1, startSeconds: 100.0),
+            CapturedSource(path: "c", sampleCount: 16000, peak: 1, rms: 1, activeLevel: 1, startSeconds: 101.0)
         ]
 
         #expect(RecordingFinalizer.leadSamples(for: sources) == [8000, 0, 16000])
