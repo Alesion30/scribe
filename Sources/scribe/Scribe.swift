@@ -22,7 +22,7 @@ struct Scribe: AsyncParsableCommand {
             Run without a subcommand to record and transcribe in one step; \
             the recording is deleted once the transcript is written, unless you pass --keep-audio or -w.
             """,
-        version: "0.1.0",
+        version: "0.2.0",
         subcommands: [
             DefaultCommand.self,
             Record.self,
