@@ -32,6 +32,8 @@ struct CapturedSource {
     let sampleCount: Int
     let peak: Float
     let rms: Float
+    /// Level the source speaks at, independent of how much of the session was silence.
+    let activeLevel: Float
     /// Host-clock instant of the first sample, or nil when no buffer carried a timestamp.
     let startSeconds: Double?
 }
@@ -47,13 +49,19 @@ struct CaptureResult {
 
 /// Turns the per-source recordings into the final mixed WAV.
 enum RecordingFinalizer {
-    /// Sources quieter than this are left out of the mix entirely.
+    /// Sources that never speak above this are left out of the mix entirely.
     /// Prevents amplifying system noise during offline meetings
     /// (where no meaningful system audio exists) and vice versa.
-    static let silenceRMSThreshold: Float = 0.01
+    ///
+    /// Sits between room tone and speech: a quiet room meters around -57 dBFS, and even a
+    /// microphone whose input level is set low reaches -38 dBFS once someone talks.
+    static let silenceLevelThreshold: Float = 0.003
 
     /// Level each source is brought to before mixing, so a quiet mic doesn't get buried.
-    static let mixTargetPeak: Float = 0.5
+    static let mixTargetLevel: Float = 0.08
+
+    /// Ceiling the mix gain is held under, leaving both sources room to sum without clipping.
+    static let mixPeakCeiling: Float = 0.7
 
     /// Samples mixed per iteration. Bounds the working set, not the result.
     static let chunkSize = 1 << 16
@@ -76,7 +84,7 @@ enum RecordingFinalizer {
         guard !active.isEmpty else {
             Log.warning("Every source was near-silent; keeping the source recordings:")
             for source in result.sources {
-                Log.status("  \(source.path)")
+                Log.status("  \(source.path) (level=\(String(format: "%.5f", source.activeLevel)), peak=\(String(format: "%.4f", source.peak)))")
             }
             return []
         }
@@ -111,21 +119,25 @@ enum RecordingFinalizer {
     private static func includeIfAudible(_ source: CapturedSource?, label: String) -> CapturedSource? {
         guard let source else { return nil }
 
-        guard source.rms >= silenceRMSThreshold else {
-            Log.info("\(label) audio is near-silent (RMS=\(String(format: "%.5f", source.rms))), excluding from mix")
+        guard source.activeLevel >= silenceLevelThreshold else {
+            Log.info("\(label) audio is near-silent (level=\(String(format: "%.5f", source.activeLevel))), excluding from mix")
             return nil
         }
 
-        Log.debug("\(label) audio RMS: \(String(format: "%.5f", source.rms))")
+        Log.debug("\(label) audio level: \(String(format: "%.5f", source.activeLevel)) (overall RMS \(String(format: "%.5f", source.rms)))")
         return source
     }
 
-    /// Gain that brings a source to the mix target, matching AudioWriter.normalize.
-    private static func mixGain(for source: CapturedSource) -> Float {
-        guard source.peak > 0 else { return 1.0 }
+    /// Gain that brings a source's speaking level to the mix target.
+    ///
+    /// Matched on the speaking level rather than the peak so that one cough or table knock
+    /// cannot decide the gain for the whole recording and bury everything that was said.
+    static func mixGain(for source: CapturedSource) -> Float {
+        guard source.activeLevel > 0 else { return 1.0 }
 
-        let gain = mixTargetPeak / source.peak
-        return abs(gain - 1.0) < 0.05 ? 1.0 : gain
+        let gain = mixTargetLevel / source.activeLevel
+        guard source.peak > 0 else { return gain }
+        return min(gain, mixPeakCeiling / source.peak)
     }
 
     /// Silence each source needs at the front so they line up on the host clock.

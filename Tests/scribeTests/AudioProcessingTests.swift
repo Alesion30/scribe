@@ -60,27 +60,29 @@ struct AudioProcessingTests {
         return p
     }
 
+    /// The finalizer's own audibility test, so these cases track the rule that actually ships.
+    static func isAudible(_ samples: [Float]) -> Bool {
+        LevelMeter.activeLevel(of: samples) >= RecordingFinalizer.silenceLevelThreshold
+    }
+
     // MARK: - Silence Detection Tests
 
-    @Test("Near-silent audio has RMS below threshold")
-    func silentAudioRMSBelowThreshold() {
+    @Test("Near-silent audio is not audible")
+    func silentAudioIsNotAudible() {
         let silent = Self.silence(durationSeconds: 5.0)
-        let rmsValue = Self.rms(silent)
-        #expect(rmsValue < 0.01, "Silent audio RMS (\(rmsValue)) should be below 0.01 threshold")
+        #expect(!Self.isAudible(silent), "Silent audio level (\(LevelMeter.activeLevel(of: silent))) should be below the threshold")
     }
 
-    @Test("Speech audio has RMS above threshold")
-    func speechAudioRMSAboveThreshold() {
+    @Test("Speech audio is audible")
+    func speechAudioIsAudible() {
         let speech = Self.sineWave(frequency: 300, amplitude: 0.3, durationSeconds: 5.0)
-        let rmsValue = Self.rms(speech)
-        #expect(rmsValue > 0.01, "Speech audio RMS (\(rmsValue)) should be above 0.01 threshold")
+        #expect(Self.isAudible(speech), "Speech level (\(LevelMeter.activeLevel(of: speech))) should be above the threshold")
     }
 
-    @Test("Room audio with speech has RMS above threshold")
-    func roomAudioRMSAboveThreshold() {
+    @Test("Room audio with speech is audible")
+    func roomAudioIsAudible() {
         let room = Self.roomAudio(durationSeconds: 5.0)
-        let rmsValue = Self.rms(room)
-        #expect(rmsValue > 0.01, "Room audio RMS (\(rmsValue)) should be above 0.01 threshold")
+        #expect(Self.isAudible(room), "Room audio level (\(LevelMeter.activeLevel(of: room))) should be above the threshold")
     }
 
     // MARK: - Mixing Pipeline Tests (the core fix)
@@ -97,10 +99,8 @@ struct AudioProcessingTests {
         let mixedWithoutFix = AudioWriter.mix(normalizedMic, normalizedSystem)
 
         // Pipeline WITH fix: detect silence, exclude system, use mic only
-        let silenceThreshold: Float = 0.01
-        let systemRMS = Self.rms(systemAudio)
         let micOnly: [Float]
-        if systemRMS < silenceThreshold {
+        if !Self.isAudible(systemAudio) {
             // Fix applied: skip system audio
             micOnly = AudioWriter.normalize(micAudio, targetPeak: 0.5)
         } else {
@@ -131,13 +131,9 @@ struct AudioProcessingTests {
         let micAudio = Self.sineWave(frequency: 300, amplitude: 0.2, durationSeconds: 5.0)
         let systemAudio = Self.sineWave(frequency: 500, amplitude: 0.3, durationSeconds: 5.0)
 
-        let silenceThreshold: Float = 0.01
-        let micRMS = Self.rms(micAudio)
-        let systemRMS = Self.rms(systemAudio)
-
         // Neither should be detected as silent
-        #expect(micRMS >= silenceThreshold, "Mic audio should not be detected as silent")
-        #expect(systemRMS >= silenceThreshold, "System audio should not be detected as silent")
+        #expect(Self.isAudible(micAudio), "Mic audio should not be detected as silent")
+        #expect(Self.isAudible(systemAudio), "System audio should not be detected as silent")
 
         // Both should be mixed
         let normalizedMic = AudioWriter.normalize(micAudio, targetPeak: 0.5)
@@ -199,6 +195,28 @@ struct AudioProcessingTests {
 
         #expect(denoisedSilentRMS <= originalSilentRMS,
                 "Silent segment RMS should decrease after noise gate (before: \(originalSilentRMS), after: \(denoisedSilentRMS))")
+    }
+
+    @Test("Noise gate keeps the quiet half of a recording that never falls silent")
+    func noiseGateKeepsQuietSpeechInADenseRecording() {
+        // A meeting with no gaps: the quietest fifth is a softer speaker, not the room.
+        // Estimating the noise floor from it puts the floor inside the voice.
+        let sampleRate = Float(AudioWriter.sampleRate)
+        let count = Int(sampleRate * 8)
+        let quietStart = count * 3 / 4
+        let audio = (0..<count).map { i -> Float in
+            let amplitude: Float = i < quietStart ? 0.3 : 0.06
+            return amplitude * sinf(2.0 * .pi * 300.0 * Float(i) / sampleRate)
+        }
+
+        let denoised = AudioWriter.reduceNoise(from: audio)
+
+        // Measured clear of the window the gate ramps across.
+        let from = quietStart + LevelMeter.windowSamples * 2
+        let to = count - LevelMeter.windowSamples * 2
+        let kept = Self.rms(Array(denoised[from..<to])) / Self.rms(Array(audio[from..<to]))
+
+        #expect(kept > 0.5, "the softer speaker was cut to \(kept) of their level")
     }
 
     // MARK: - Mix Tests
@@ -281,13 +299,10 @@ struct AudioProcessingTests {
         let unfixedOutput = AudioWriter.normalize(unfixedDenoised, targetPeak: 0.9)
 
         // --- WITH FIX: detect silence, exclude system audio ---
-        let silenceThreshold: Float = 0.01
         var fixedMic = micSamples
         var fixedSystem = systemSamples
 
-        var sysSumSq: Float = 0
-        vDSP_svesq(fixedSystem, 1, &sysSumSq, vDSP_Length(fixedSystem.count))
-        if sqrtf(sysSumSq / Float(fixedSystem.count)) < silenceThreshold {
+        if !Self.isAudible(fixedSystem) {
             fixedSystem = []
         }
 
@@ -347,21 +362,17 @@ struct AudioProcessingTests {
         // Simulate system audio that's quiet but has real content
         // e.g., someone has their volume low in an online meeting
         let quietSpeech = Self.sineWave(frequency: 400, amplitude: 0.05, durationSeconds: 5.0)
-        let rmsValue = Self.rms(quietSpeech)
-        #expect(rmsValue > 0.01, "Quiet real audio RMS (\(rmsValue)) should be above silence threshold")
+        #expect(Self.isAudible(quietSpeech), "Quiet real audio level (\(LevelMeter.activeLevel(of: quietSpeech))) should be above the threshold")
     }
 
-    @Test("Threshold boundary: audio at exactly threshold level")
+    @Test("Threshold boundary: noise floors either side of the audible level")
     func thresholdBoundary() {
-        // Create audio with RMS just above and just below threshold
-        let belowThreshold = Self.silence(durationSeconds: 5.0, noiseAmplitude: 0.005)
-        let belowRMS = Self.rms(belowThreshold)
-        #expect(belowRMS < 0.01, "Below-threshold audio RMS (\(belowRMS)) should be < 0.01")
+        // Uniform noise meters at amplitude/sqrt(3), which puts these either side of the threshold.
+        let belowThreshold = Self.silence(durationSeconds: 5.0, noiseAmplitude: 0.002)
+        #expect(!Self.isAudible(belowThreshold), "level \(LevelMeter.activeLevel(of: belowThreshold)) should be below the threshold")
 
-        // Audio with amplitude ~0.03 should give RMS ~0.017 (above threshold)
-        let aboveThreshold = (0..<80000).map { _ in Float.random(in: -0.03...0.03) }
-        let aboveRMS = Self.rms(aboveThreshold)
-        #expect(aboveRMS > 0.01, "Above-threshold audio RMS (\(aboveRMS)) should be > 0.01")
+        let aboveThreshold = Self.silence(durationSeconds: 5.0, noiseAmplitude: 0.02)
+        #expect(Self.isAudible(aboveThreshold), "level \(LevelMeter.activeLevel(of: aboveThreshold)) should be above the threshold")
     }
 
     // MARK: - Full Pipeline Integration Test
@@ -373,27 +384,15 @@ struct AudioProcessingTests {
         let systemSamples = Self.silence(durationSeconds: 10.0, noiseAmplitude: 0.0003)
 
         // Step 1: Silence detection (the fix)
-        let silenceRMSThreshold: Float = 0.01
         var activeMic = micSamples
         var activeSystem = systemSamples
 
-        var sysSumSq: Float = 0
-        vDSP_svesq(activeSystem, 1, &sysSumSq, vDSP_Length(activeSystem.count))
-        let sysRMS = sqrtf(sysSumSq / Float(activeSystem.count))
-        if sysRMS < silenceRMSThreshold {
-            activeSystem = []  // Excluded
-        }
-
-        var micSumSq: Float = 0
-        vDSP_svesq(activeMic, 1, &micSumSq, vDSP_Length(activeMic.count))
-        let micRMS = sqrtf(micSumSq / Float(activeMic.count))
-        if micRMS < silenceRMSThreshold {
-            activeMic = []
-        }
+        if !Self.isAudible(activeSystem) { activeSystem = [] }
+        if !Self.isAudible(activeMic) { activeMic = [] }
 
         // Verify system was excluded, mic was kept
-        #expect(activeSystem.isEmpty, "System audio should be excluded (RMS=\(sysRMS))")
-        #expect(!activeMic.isEmpty, "Mic audio should be kept (RMS=\(micRMS))")
+        #expect(activeSystem.isEmpty, "System audio should be excluded")
+        #expect(!activeMic.isEmpty, "Mic audio should be kept")
 
         // Step 2: Normalize (only mic since system was excluded)
         let mixTarget: Float = 0.5

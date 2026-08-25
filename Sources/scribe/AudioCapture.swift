@@ -335,6 +335,7 @@ final class SourceRecorder: @unchecked Sendable {
     // Running levels, so the mix gains can be chosen without re-reading the file.
     private var peak: Float = 0
     private var sumSquares: Double = 0
+    private var levels = LevelMeter()
 
     private var timeline = CaptureTimeline()
     private var silenceFilled = 0
@@ -372,6 +373,8 @@ final class SourceRecorder: @unchecked Sendable {
             Log.error("Failed to finalize \(label) recording: \(error.localizedDescription)")
         }
 
+        levels.finalize()
+
         let count = writer.sampleCount
         guard count > 0 else {
             try? FileManager.default.removeItem(atPath: path)
@@ -391,6 +394,7 @@ final class SourceRecorder: @unchecked Sendable {
             sampleCount: count,
             peak: peak,
             rms: Float((sumSquares / Double(count)).squareRoot()),
+            activeLevel: levels.activeLevel,
             startSeconds: timeline.startSeconds
         )
     }
@@ -419,6 +423,9 @@ final class SourceRecorder: @unchecked Sendable {
         var sumSq: Float = 0
         vDSP_svesq(resampled, 1, &sumSq, vDSP_Length(resampled.count))
         sumSquares += Double(sumSq)
+
+        // Only real samples are metered: the silence filled below stands for audio that never arrived.
+        levels.add(resampled)
 
         do {
             // Restore the hole a dropped buffer left, so what follows stays where the clock says it was.
